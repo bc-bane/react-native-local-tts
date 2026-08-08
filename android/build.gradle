@@ -1,0 +1,32 @@
+apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
+if (expoModulesCorePlugin.exists()) {
+  apply from: expoModulesCorePlugin
+  applyKotlinExpoModulesCorePlugin()
+  useCoreDependencies()
+  useExpoPublishing()
+} else {
+  def expoModulesCorePath = new File(
+    ["node", "--print", "require.resolve('expo-modules-core/package.json')"]
+      .execute(null, rootProject.rootDir)
+      .text.trim()
+  ).parentFile.absolutePath
+  apply from: "$expoModulesCorePath/gradle/android-native-library.gradle"
+}
+
+android {
+  namespace "expo.modules.localtts"
+  compileSdkVersion 35
+
+  defaultConfig {
+    minSdkVersion 24
+    targetSdkVersion 35
+  }
+}
+
+dependencies {
+  implementation project(':expo-modules-core')
+  implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+}

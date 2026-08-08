@@ -1,0 +1,11 @@
+{
+  "name": "LocalTtsModule",
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["LocalTtsModule"],
+    "podspecPath": "react-native-local-tts.podspec"
+  },
+  "android": {
+    "modules": ["expo.modules.localtts.LocalTtsModule"]
+  }
+}
