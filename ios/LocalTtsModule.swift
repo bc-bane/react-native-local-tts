@@ -76,9 +76,9 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 
         var audioFile: AVAudioFile?
         var writeError: Error?
-        let fileSynthesizer = AVSpeechSynthesizer()
+        var fileSynthesizer: AVSpeechSynthesizer? = AVSpeechSynthesizer()
 
-        fileSynthesizer.write(utterance) { buffer in
+        fileSynthesizer?.write(utterance) { buffer in
           guard let pcmBuffer = buffer as? AVAudioPCMBuffer,
                 pcmBuffer.frameLength > 0 else {
             // Empty buffer signals completion
@@ -87,6 +87,7 @@ public class LocalTtsModule: Module, @unchecked Sendable {
             } else {
               promise.resolve(nil)
             }
+            fileSynthesizer = nil // Break the retain cycle
             return
           }
 
