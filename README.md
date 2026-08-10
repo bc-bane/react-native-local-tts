@@ -156,7 +156,7 @@ subs.forEach(sub => sub.remove());
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `text` | `string` | — | **Required.** Text to synthesize. |
-| `filePath` | `string` | — | **Required.** Absolute path for the output audio file. |
+| `filePath` | `string` | — | **Required.** Absolute path ending in `.wav`. |
 | `rate` | `number` | `1.0` | Speech rate multiplier (0.5 = half, 2.0 = double). |
 | `pitch` | `number` | `1.0` | Pitch multiplier (0.5 = lower, 2.0 = higher). |
 | `language` | `string` | device default | BCP-47 language tag. |
@@ -189,7 +189,7 @@ All event functions return `{ remove: () => void }` to unsubscribe.
 ### iOS
 - Uses `AVSpeechSynthesizer` for speech and `AVSpeechSynthesizer.write(_:toBufferCallback:)` (iOS 13+) for file synthesis.
 - Activates `AVAudioSession` with `.playback` / `.spokenAudio` before synthesis.
-- File synthesis converts buffers to Int16 mono and writes `.wav` via `AVAudioFile`.
+- File synthesis streams buffers as Int16 mono into a `.wav` (`filePath` must end with `.wav`).
 - Voice quality tiers map to `AVSpeechSynthesisVoiceQuality` (`.default`, `.enhanced`, `.premium`).
 
 ### Android

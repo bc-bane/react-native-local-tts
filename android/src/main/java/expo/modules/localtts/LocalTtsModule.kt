@@ -134,6 +134,15 @@ class LocalTtsModule : Module() {
         return@AsyncFunction
       }
 
+      if (!options.filePath.endsWith(".wav", ignoreCase = true)) {
+        promise.reject(
+          "ERR_TTS_FILE_PATH",
+          "synthesizeToFile requires a .wav filePath",
+          null
+        )
+        return@AsyncFunction
+      }
+
       // Android engines commonly truncate / fail past ~3999 characters per request.
       if (options.text.length > 3999) {
         promise.reject(

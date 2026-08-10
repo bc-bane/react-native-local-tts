@@ -86,14 +86,23 @@ function normalizeSpeak(options: SpeakOptions) {
 }
 
 function normalizeSynthesize(options: SynthesizeOptions) {
+  const filePath = options.filePath.replace(/^file:\/\//, "");
   return {
     text: options.text,
-    filePath: options.filePath,
+    filePath,
     rate: options.rate ?? 1.0,
     pitch: options.pitch ?? 1.0,
     language: options.language ?? "",
     voice: options.voice ?? "",
   };
+}
+
+function assertWavFilePath(filePath: string): void {
+  if (!filePath.toLowerCase().endsWith(".wav")) {
+    throw new Error(
+      "[react-native-local-tts] synthesizeToFile requires a .wav filePath"
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,14 +131,18 @@ export async function speak(options: SpeakOptions): Promise<void> {
  * engine. The promise resolves once the entire file has been written.
  *
  * - **iOS**: Uses `AVSpeechSynthesizer.write(_:toBufferCallback:)` to capture
- *   PCM buffers, converts them to Int16 mono, then writes a `.wav` via `AVAudioFile`.
+ *   PCM buffers, streams them as Int16 mono into a `.wav` via `AVAudioFile`.
  * - **Android**: Uses `TextToSpeech.synthesizeToFile()` which writes a `.wav`.
+ *
+ * `filePath` must end with `.wav`.
  *
  * @throws {LocalTtsUnavailableError} If the native module is not installed.
  */
 export async function synthesizeToFile(options: SynthesizeOptions): Promise<void> {
   if (!NativeLocalTts) throw new LocalTtsUnavailableError();
-  return NativeLocalTts.synthesizeToFile(normalizeSynthesize(options));
+  const normalized = normalizeSynthesize(options);
+  assertWavFilePath(normalized.filePath);
+  return NativeLocalTts.synthesizeToFile(normalized);
 }
 
 /**

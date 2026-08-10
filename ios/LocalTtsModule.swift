@@ -1,3 +1,4 @@
+import Accelerate
 import ExpoModulesCore
 import AVFoundation
 
@@ -73,17 +74,30 @@ public class LocalTtsModule: Module, @unchecked Sendable {
           return
         }
 
+        if options.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          promise.reject("ERR_TTS_FILE", "synthesizeToFile requires non-empty text")
+          return
+        }
+
+        let fileURL = URL(fileURLWithPath: options.filePath)
+        guard fileURL.pathExtension.lowercased() == "wav" else {
+          promise.reject(
+            "ERR_TTS_FILE_PATH",
+            "synthesizeToFile requires a .wav filePath; AVAudioFile selects the container from the extension"
+          )
+          return
+        }
+
         self.configureAudioSessionIfNeeded()
 
         let utterance = self.buildUtterance(options)
-        let fileURL = URL(fileURLWithPath: options.filePath)
 
         // Ensure parent directory exists; overwrite any prior file at this path.
         let dir = fileURL.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? FileManager.default.removeItem(at: fileURL)
 
-        var audioFile: AVAudioFile?
+        let sink = Int16MonoWavSink(fileURL: fileURL)
         var writeError: Error?
         var didSettle = false
         let settleLock = NSLock()
@@ -106,9 +120,26 @@ public class LocalTtsModule: Module, @unchecked Sendable {
         // synthesizeToFile calls cannot interleave PCM writes / file headers.
         let done = DispatchSemaphore(value: 0)
 
+        func failAndStop(_ error: Error) {
+          // Settle immediately: stopSpeaking does not always deliver a terminal
+          // buffer on every iOS version, and we must not block the synth queue.
+          writeError = error
+          settle {
+            promise.reject("ERR_TTS_FILE_WRITE", error.localizedDescription)
+            self.activeFileSynthesizer = nil
+          }
+          fileSynthesizer.stopSpeaking(at: .immediate)
+          done.signal()
+        }
+
         fileSynthesizer.write(utterance) { [weak self, weak fileSynthesizer] buffer in
           guard let pcmBuffer = buffer as? AVAudioPCMBuffer else { return }
           _ = fileSynthesizer // intentional weak capture (module retains via activeFileSynthesizer)
+
+          // Ignore further buffers after the first hard failure.
+          if writeError != nil {
+            return
+          }
 
           // iOS ≤16 ends with frameLength == 0. iOS 17+ Float32 paths often end
           // with a trailing buffer of frameLength == 1 (silent). Treat both as done.
@@ -121,9 +152,7 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 
           if isTerminalBuffer {
             settle {
-              if let err = writeError {
-                promise.reject("ERR_TTS_FILE_WRITE", err.localizedDescription)
-              } else if audioFile == nil {
+              if !sink.didWriteAudio {
                 promise.reject(
                   "ERR_TTS_FILE_EMPTY",
                   "synthesizeToFile produced no audio buffers"
@@ -139,28 +168,9 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 
           autoreleasepool {
             do {
-              // Always write Int16 mono WAV. AVSpeech buffers are often Float32
-              // CAF-oriented formats that miniaudio (and many players) cannot decode.
-              guard let wavBuffer = Self.convertToInt16MonoWavBuffer(pcmBuffer) else {
-                writeError = NSError(
-                  domain: "LocalTts",
-                  code: -1,
-                  userInfo: [
-                    NSLocalizedDescriptionKey: "Failed to convert TTS PCM buffer to Int16 WAV",
-                  ]
-                )
-                return
-              }
-
-              if audioFile == nil {
-                audioFile = try AVAudioFile(
-                  forWriting: fileURL,
-                  settings: wavBuffer.format.settings
-                )
-              }
-              try audioFile?.write(from: wavBuffer)
+              try sink.write(pcmBuffer)
             } catch {
-              writeError = error
+              failAndStop(error)
             }
           }
         }
@@ -201,86 +211,6 @@ public class LocalTtsModule: Module, @unchecked Sendable {
   }
 
   // MARK: - Helpers
-
-  /// Converts an AVSpeech PCM buffer to interleaved Int16 mono for WAV output.
-  private static func convertToInt16MonoWavBuffer(
-    _ buffer: AVAudioPCMBuffer
-  ) -> AVAudioPCMBuffer? {
-    let frames = Int(buffer.frameLength)
-    guard frames > 0 else { return nil }
-
-    guard
-      let outFormat = AVAudioFormat(
-        commonFormat: .pcmFormatInt16,
-        sampleRate: buffer.format.sampleRate,
-        channels: 1,
-        interleaved: true
-      ),
-      let out = AVAudioPCMBuffer(
-        pcmFormat: outFormat,
-        frameCapacity: AVAudioFrameCount(frames)
-      ),
-      let dst = out.int16ChannelData?[0]
-    else {
-      return nil
-    }
-
-    out.frameLength = AVAudioFrameCount(frames)
-    let channels = Int(buffer.format.channelCount)
-    guard channels > 0 else { return nil }
-
-    if buffer.format.commonFormat == .pcmFormatFloat32,
-      let src = buffer.floatChannelData
-    {
-      for i in 0..<frames {
-        var sample: Float = 0
-        for ch in 0..<channels {
-          sample += src[ch][i]
-        }
-        if channels > 1 {
-          sample /= Float(channels)
-        }
-        let clipped = max(-1.0 as Float, min(1.0 as Float, sample))
-        dst[i] = Int16((clipped * Float(Int16.max)).rounded())
-      }
-      return out
-    }
-
-    if buffer.format.commonFormat == .pcmFormatInt16,
-      let src = buffer.int16ChannelData
-    {
-      if channels == 1 {
-        memcpy(dst, src[0], frames * MemoryLayout<Int16>.size)
-      } else {
-        for i in 0..<frames {
-          var sum = 0
-          for ch in 0..<channels {
-            sum += Int(src[ch][i])
-          }
-          dst[i] = Int16(sum / channels)
-        }
-      }
-      return out
-    }
-
-    // Fallback for uncommon formats (e.g. Int32): convert via AVAudioConverter.
-    guard let converter = AVAudioConverter(from: buffer.format, to: outFormat) else {
-      return nil
-    }
-    var converted = false
-    var convertError: NSError?
-    let status = converter.convert(to: out, error: &convertError) { _, outStatus in
-      if converted {
-        outStatus.pointee = .noDataNow
-        return nil
-      }
-      converted = true
-      outStatus.pointee = .haveData
-      return buffer
-    }
-    guard convertError == nil, status != .error else { return nil }
-    return out
-  }
 
   private func configureAudioSessionIfNeeded() {
     do {
@@ -401,6 +331,190 @@ public class LocalTtsModule: Module, @unchecked Sendable {
       if voice.quality == .enhanced { return 2 }
     }
     return 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming Int16 mono WAV writer
+// ---------------------------------------------------------------------------
+
+/// Streams AVSpeech PCM chunks to a `.wav` file as interleaved Int16 mono.
+/// Reuses output format + scratch buffers across callbacks to avoid per-chunk alloc churn.
+private final class Int16MonoWavSink {
+  enum SinkError: LocalizedError {
+    case invalidFormat
+    case convertFailed
+
+    var errorDescription: String? {
+      switch self {
+      case .invalidFormat:
+        return "Failed to create Int16 mono WAV format for TTS output"
+      case .convertFailed:
+        return "Failed to convert TTS PCM buffer to Int16 mono WAV"
+      }
+    }
+  }
+
+  private let fileURL: URL
+  private var audioFile: AVAudioFile?
+  private var outFormat: AVAudioFormat?
+  private var scratch: AVAudioPCMBuffer?
+  private var converter: AVAudioConverter?
+  private var converterSourceFormatKey: String?
+  private(set) var didWriteAudio = false
+
+  init(fileURL: URL) {
+    self.fileURL = fileURL
+  }
+
+  func write(_ buffer: AVAudioPCMBuffer) throws {
+    let frames = Int(buffer.frameLength)
+    guard frames > 0 else { return }
+
+    if outFormat == nil {
+      guard
+        let format = AVAudioFormat(
+          commonFormat: .pcmFormatInt16,
+          sampleRate: buffer.format.sampleRate,
+          channels: 1,
+          interleaved: true
+        )
+      else {
+        throw SinkError.invalidFormat
+      }
+      outFormat = format
+      // Path extension is validated as .wav by the caller; settings are Linear PCM.
+      audioFile = try AVAudioFile(forWriting: fileURL, settings: format.settings)
+    }
+
+    guard let outFormat, let audioFile else {
+      throw SinkError.invalidFormat
+    }
+
+    // Zero-copy: already Int16 mono at the locked sample rate.
+    if buffer.format.commonFormat == .pcmFormatInt16,
+      buffer.format.channelCount == 1,
+      buffer.format.sampleRate == outFormat.sampleRate
+    {
+      try audioFile.write(from: buffer)
+      didWriteAudio = true
+      return
+    }
+
+    let out = try ensureScratch(capacity: frames, format: outFormat)
+    out.frameLength = AVAudioFrameCount(frames)
+    try fillInt16Mono(from: buffer, into: out, format: outFormat)
+    try audioFile.write(from: out)
+    didWriteAudio = true
+  }
+
+  private func ensureScratch(capacity: Int, format: AVAudioFormat) throws -> AVAudioPCMBuffer {
+    if let scratch, Int(scratch.frameCapacity) >= capacity {
+      return scratch
+    }
+    guard
+      let buffer = AVAudioPCMBuffer(
+        pcmFormat: format,
+        frameCapacity: AVAudioFrameCount(capacity)
+      )
+    else {
+      throw SinkError.invalidFormat
+    }
+    scratch = buffer
+    return buffer
+  }
+
+  private func fillInt16Mono(
+    from buffer: AVAudioPCMBuffer,
+    into out: AVAudioPCMBuffer,
+    format outFormat: AVAudioFormat
+  ) throws {
+    let frames = Int(buffer.frameLength)
+    let channels = Int(buffer.format.channelCount)
+    guard frames > 0, channels > 0, let dst = out.int16ChannelData?[0] else {
+      throw SinkError.convertFailed
+    }
+
+    if buffer.format.commonFormat == .pcmFormatFloat32,
+      let src = buffer.floatChannelData
+    {
+      if channels == 1 {
+        Self.convertMonoFloat32ToInt16(src: src[0], dst: dst, frames: frames)
+      } else {
+        for i in 0..<frames {
+          var sample: Float = 0
+          for ch in 0..<channels {
+            sample += src[ch][i]
+          }
+          sample /= Float(channels)
+          let clipped = max(-1 as Float, min(1 as Float, sample))
+          dst[i] = Int16((clipped * Float(Int16.max)).rounded())
+        }
+      }
+      return
+    }
+
+    if buffer.format.commonFormat == .pcmFormatInt16,
+      let src = buffer.int16ChannelData
+    {
+      if channels == 1 {
+        memcpy(dst, src[0], frames * MemoryLayout<Int16>.size)
+      } else {
+        for i in 0..<frames {
+          var sum = 0
+          for ch in 0..<channels {
+            sum += Int(src[ch][i])
+          }
+          dst[i] = Int16(sum / channels)
+        }
+      }
+      return
+    }
+
+    // Uncommon formats (e.g. Int32): reuse one AVAudioConverter per source format.
+    let sourceKey =
+      "\(buffer.format.commonFormat.rawValue)-\(buffer.format.sampleRate)-\(buffer.format.channelCount)-\(buffer.format.isInterleaved)"
+    if converter == nil || converterSourceFormatKey != sourceKey {
+      guard let newConverter = AVAudioConverter(from: buffer.format, to: outFormat) else {
+        throw SinkError.convertFailed
+      }
+      converter = newConverter
+      converterSourceFormatKey = sourceKey
+    }
+    guard let converter else { throw SinkError.convertFailed }
+
+    var provided = false
+    var convertError: NSError?
+    let status = converter.convert(to: out, error: &convertError) { _, outStatus in
+      if provided {
+        outStatus.pointee = .noDataNow
+        return nil
+      }
+      provided = true
+      outStatus.pointee = .haveData
+      return buffer
+    }
+    guard convertError == nil, status != .error else {
+      throw SinkError.convertFailed
+    }
+  }
+
+  /// Clip → scale → quantize using Accelerate; temp floats live on the stack when possible.
+  private static func convertMonoFloat32ToInt16(
+    src: UnsafePointer<Float>,
+    dst: UnsafeMutablePointer<Int16>,
+    frames: Int
+  ) {
+    let n = vDSP_Length(frames)
+    withUnsafeTemporaryAllocation(of: Float.self, capacity: frames) { temp in
+      guard let tempBase = temp.baseAddress else { return }
+      var lo: Float = -1
+      var hi: Float = 1
+      vDSP_vclip(src, 1, &lo, &hi, tempBase, 1, n)
+      var scale = Float(Int16.max)
+      vDSP_vsmul(tempBase, 1, &scale, tempBase, 1, n)
+      vDSP_vfixq(tempBase, 1, dst, 1, n)
+    }
   }
 }
 

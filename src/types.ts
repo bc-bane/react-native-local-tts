@@ -46,9 +46,8 @@ export type SynthesizeOptions = {
   /** The text to synthesize to an audio file. */
   text: string;
   /**
-   * Absolute file path on the device where the audio will be written.
-   * Writes a `.wav` file with Int16 PCM on both iOS and Android.
-   * Prefer a `.wav` path extension so `AVAudioFile` selects the WAV container.
+   * Absolute filesystem path for the output audio file.
+   * Must end with `.wav` (Int16 PCM). The extension selects the container on iOS.
    */
   filePath: string;
   /**
