@@ -4,7 +4,11 @@ export type {
   SpeechErrorEvent,
   SpeechProgressEvent,
   Subscription,
+  SynthesizeFileResult,
   SynthesizeOptions,
+  SynthesizeUtterance,
+  SynthesizeUtterancesOptions,
+  ConcatWavOptions,
   TtsVoice,
   VoiceInfo,
 } from "./types";
@@ -21,6 +25,8 @@ export {
   speak,
   stop,
   synthesizeToFile,
+  synthesizeUtterancesToFile,
+  concatWavFiles,
 } from "./LocalTts";
 
 export { useLocalTts } from "./useLocalTts";

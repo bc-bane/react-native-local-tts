@@ -1,102 +1,197 @@
 # react-native-local-tts
 
-> **Expo module** for local on-device text-to-speech synthesis on iOS and Android — speak text aloud, synthesize to audio files, list available voices, and receive word-level progress events.
+On-device text-to-speech for React Native. Speaks through the system engines (`AVSpeechSynthesizer` on iOS, `TextToSpeech` on Android), can write Int16 mono WAV files for offline playback, and exposes word-level progress while speaking.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+Built as an [Expo module](https://docs.expo.dev/modules/overview/). Works in Expo apps (dev client / production builds) and in bare React Native once Expo modules are installed. **Does not run in Expo Go.**
 
-## Features
-
-- **Speak text aloud** via `AVSpeechSynthesizer` (iOS) and `TextToSpeech` (Android)
-- **Synthesize text to audio files** (`.wav` on iOS and Android)
-- **List available voices** with quality tiers and language tags
-- **Word-level progress events** (`onSpeechProgress`) for live UI updates
-- **Speech lifecycle events** — start, done, error
-- **React hook** — `useLocalTts()` for progress, synthesis status, and errors
-- **Playback control** — `stop()` and `isSpeaking()`
-- **Expo SDK 56+ / React Native New Architecture** compatible
-- **No Expo Go** required — works with dev clients and standalone builds
+| | |
+| --- | --- |
+| Platforms | iOS 13+, Android API 24+ |
+| Peer deps | `expo` ≥ 56, `react-native` ≥ 0.78, `react` ≥ 19.2 |
+| Output format | `.wav` (Int16 mono PCM) |
 
 ---
 
-## Installation
+## Install
+
+### Expo project
+
+```bash
+npx expo install react-native-local-tts
+```
+
+Or with your usual package manager, then reinstall pods:
 
 ```bash
 npm install react-native-local-tts
-# or
-yarn add react-native-local-tts
+cd ios && pod install && cd ..
 ```
 
-Autolinking handles native registration — no manual linking required.
+Rebuild the native app (`npx expo run:ios` / `run:android` or your Xcode / Android Studio flow). Autolinking picks up the module; there is nothing to add to `app.json`.
 
-> **Note**: This module requires a **dev client** or **standalone build**. It does not work in Expo Go.
+### Bare React Native (no Expo app workflow)
 
-### iOS
+This package depends on `expo-modules-core`. If your app does not already include Expo modules, add them first:
 
 ```bash
-cd ios && pod install
+npx install-expo-modules@latest
 ```
 
-### Android
+That command wires the `expo` package into your iOS and Android projects. If it fails on a heavily customized app, follow Expo’s [manual install guide](https://docs.expo.dev/bare/installing-expo-modules/).
 
-No additional setup needed.
+Then install this library and refresh native deps:
+
+```bash
+npm install react-native-local-tts
+# or: yarn add react-native-local-tts / pnpm add react-native-local-tts
+
+cd ios && pod install && cd ..
+```
+
+Rebuild from Xcode / Android Studio (or `npx react-native run-ios` / `run-android`). A Metro reload alone is not enough after the first install — the native module has to be compiled in.
+
+**Quick check** after a successful rebuild:
+
+```ts
+import { isAvailable, getVoices } from "react-native-local-tts";
+
+console.log(isAvailable); // true
+console.log(await getVoices());
+```
+
+If `isAvailable` is `false`, the JS bundle is present but the native binary was not rebuilt (or Expo modules are not linked).
 
 ---
 
-## Quick Start
+## Usage
 
-```tsx
-import { speak, synthesizeToFile, getVoices, stop, isSpeaking } from 'react-native-local-tts';
+### Speak
 
-// Speak text aloud — promise resolves when speech finishes
+```ts
+import { speak, stop, isSpeaking } from "react-native-local-tts";
+
 await speak({
-  text: 'Hello, world!',
-  language: 'en-US',
-  rate: 1.0,
-  pitch: 1.0,
+  text: "Hello from the device TTS engine.",
+  language: "en-US",
+  rate: 1,
+  pitch: 1,
 });
 
-// Synthesize text to an audio file
-await synthesizeToFile({
-  text: 'This will be saved to a file.',
-  filePath: `${FileSystem.documentDirectory}speech.wav`,
-  rate: 1.0,
-  pitch: 1.0,
-  language: 'en-US',
-});
-
-// List available voices
-const voices = await getVoices();
-const englishVoices = voices.filter(v => v.language.startsWith('en'));
-console.log(englishVoices);
-
-// Stop current speech
-stop();
-
-// Check if currently speaking
-console.log(isSpeaking()); // true or false
+if (isSpeaking()) {
+  stop();
+}
 ```
 
-### React Hook
+`speak` resolves when playback finishes (or is stopped), not when it starts.
+
+### Voices
+
+```ts
+import { getVoices } from "react-native-local-tts";
+
+const voices = await getVoices();
+const premium = voices.find((v) => v.language.startsWith("en") && v.quality === "premium");
+
+await speak({
+  text: "Using a specific voice.",
+  voice: premium?.identifier,
+});
+```
+
+Identifiers are platform-specific. Prefer picking from `getVoices()` rather than hard-coding strings across iOS and Android.
+
+### Write a WAV file
+
+Paths should be absolute filesystem paths ending in `.wav`. Strip or keep the `file://` prefix — both are accepted.
+
+```ts
+import { synthesizeToFile } from "react-native-local-tts";
+import * as FileSystem from "expo-file-system";
+
+const filePath = `${FileSystem.documentDirectory}hello.wav`;
+
+await synthesizeToFile({
+  text: "Saved for later playback.",
+  filePath,
+  language: "en-US",
+  // iOS: false favors the faster spoken-audio session path
+  qualityMode: false,
+});
+```
+
+### Long text (multiple utterances → one file)
+
+For chapter-length content, prefer streaming many utterances into one file instead of concatenating in JS:
+
+```ts
+import { synthesizeUtterancesToFile } from "react-native-local-tts";
+
+const result = await synthesizeUtterancesToFile({
+  filePath: "/path/to/chapter.wav",
+  voice: selectedVoiceId,
+  qualityMode: true,
+  utterances: [
+    { text: "First paragraph.", trailingSilenceMs: 400 },
+    { text: "Second paragraph.", rate: 1.05, trailingSilenceMs: 600 },
+  ],
+});
+
+// result.durationSeconds, result.sampleRate, result.frameCount
+```
+
+If a single pass is still too large for your timeouts or UX, synthesize batches and stitch them:
+
+```ts
+import { concatWavFiles } from "react-native-local-tts";
+
+const { durationSeconds } = await concatWavFiles({
+  inputPaths: ["/path/part0.wav", "/path/part1.wav"],
+  outputPath: "/path/chapter.wav",
+});
+```
+
+`concatWavFiles` streams PCM and rewrites the WAV sizes correctly for headers that are not the classic 44-byte layout (common with `AVAudioFile` output).
+
+### Events
+
+```ts
+import {
+  onSpeechStart,
+  onSpeechDone,
+  onSpeechProgress,
+  onSpeechError,
+} from "react-native-local-tts";
+
+const subs = [
+  onSpeechStart(() => {}),
+  onSpeechDone(() => {}),
+  onSpeechProgress(({ charIndex, charLength }) => {
+    // highlight text.slice(charIndex, charIndex + charLength)
+  }),
+  onSpeechError(({ message }) => console.warn(message)),
+];
+
+// later
+subs.forEach((s) => s.remove());
+```
+
+On Android, word progress needs API 26+. Older devices still get start / done / error.
+
+### Hook
 
 ```tsx
-import { useLocalTts } from 'react-native-local-tts';
+import { useLocalTts } from "react-native-local-tts";
 
-function Reader() {
-  const { speak, synthesizeToFile, isSpeaking, isSynthesizing, progress, error } = useLocalTts();
+function SpeakButton() {
+  const { speak, stop, isSpeaking, progress, error } = useLocalTts();
 
   return (
     <>
-      <Button title={isSpeaking ? 'Speaking…' : 'Speak'} onPress={() => speak({ text: 'Hi' })} />
       <Button
-        title={isSynthesizing ? 'Writing…' : 'Save audio'}
-        onPress={() =>
-          synthesizeToFile({
-            text: 'Offline chapter',
-            filePath: `${FileSystem.documentDirectory}chapter.wav`,
-          })
-        }
+        title={isSpeaking ? "Stop" : "Speak"}
+        onPress={() => (isSpeaking ? stop() : speak({ text: "Hi there" }))}
       />
-      {progress ? <Text>Word @ {progress.charIndex}</Text> : null}
+      {progress ? <Text>@{progress.charIndex}</Text> : null}
       {error ? <Text>{error}</Text> : null}
     </>
   );
@@ -105,104 +200,113 @@ function Reader() {
 
 ---
 
-## Event Listeners
+## API
 
-Subscribe to real-time speech events for building interactive UIs:
+| Export | Returns | Notes |
+| --- | --- | --- |
+| `speak(options)` | `Promise<void>` | Live playback |
+| `synthesizeToFile(options)` | `Promise<void>` | Single string → one WAV |
+| `synthesizeUtterancesToFile(options)` | `Promise<SynthesizeFileResult>` | Many utterances → one WAV |
+| `concatWavFiles(options)` | `Promise<SynthesizeFileResult>` | Merge WAV parts on disk |
+| `getVoices()` | `Promise<VoiceInfo[]>` | Installed system voices |
+| `stop()` | `void` | Stops live speech |
+| `isSpeaking()` | `boolean` | Live speech only |
+| `isAvailable` | `boolean` | Native module linked |
+| `useLocalTts()` | hook | Speech UI state helper |
+| `onSpeechStart` / `Done` / `Progress` / `Error` | `{ remove() }` | Event subscriptions |
+| `LocalTtsUnavailableError` | class | Thrown when native code is missing |
 
-```tsx
-import { onSpeechStart, onSpeechDone, onSpeechProgress, onSpeechError } from 'react-native-local-tts';
+### Options
 
-const subs = [
-  onSpeechStart(() => console.log('Speech started')),
-  onSpeechDone(() => console.log('Speech finished')),
-  onSpeechProgress((event) => {
-    console.log(`Word at char ${event.charIndex}, length ${event.charLength}`);
-  }),
-  onSpeechError((err) => console.error('Speech error:', err.message)),
-];
+**Speak / synthesize shared fields**
 
-// Cleanup
-subs.forEach(sub => sub.remove());
+| Field | Type | Default | |
+| --- | --- | --- | --- |
+| `text` | `string` | required | |
+| `rate` | `number` | `1` | Relative speed |
+| `pitch` | `number` | `1` | Relative pitch |
+| `language` | `string` | device default | BCP-47, e.g. `en-GB` |
+| `voice` | `string` | — | Overrides `language` when set |
+| `qualityMode` | `boolean` | see below | iOS session / mode only |
+
+Defaults for `qualityMode`:
+
+- `speak` → `true` (closer to system Settings playback)
+- file APIs → `false` (faster path for bulk conversion)
+
+On iOS, `true` uses `AVAudioSession` mode `.default`; `false` uses `.spokenAudio`. Android ignores the flag.
+
+**`synthesizeUtterancesToFile`**
+
+| Field | Type | |
+| --- | --- | --- |
+| `utterances` | `{ text, rate?, pitch?, trailingSilenceMs? }[]` | Spoken in order into one file |
+| `filePath` | `string` | Absolute `.wav` path |
+| `language` / `voice` / `qualityMode` | same as above | Applied to the job |
+
+**`concatWavFiles`**
+
+| Field | Type | |
+| --- | --- | --- |
+| `inputPaths` | `string[]` | Existing WAV parts, same format |
+| `outputPath` | `string` | Destination `.wav` |
+
+**`SynthesizeFileResult`**
+
+`durationSeconds`, `sampleRate`, `frameCount` — metadata only; PCM stays on disk.
+
+**`VoiceInfo`**
+
+`identifier`, `name`, `language`, `quality` (`"default" | "enhanced" | "premium"`).
+
+---
+
+## Platform notes
+
+**iOS**
+
+- Live speech and file write both go through `AVSpeechSynthesizer`.
+- File output is Int16 mono WAV via `AVAudioFile`.
+- Premium / neural voices can be slow; long jobs use an idle watchdog rather than a short absolute timeout so multi-minute chapters can finish.
+- Changing native code in this package always requires a native rebuild.
+
+**Android**
+
+- Uses `android.speech.tts.TextToSpeech`.
+- Engine init is async; calls wait briefly for readiness on first use.
+- Very long single strings can fail inside the engine — keep utterances under a few thousand characters and batch if needed.
+
+**Both**
+
+- Offline / “enhanced” voices must already be installed by the OS user; this library does not download voice packs.
+- `stop()` affects live `speak` playback. In-flight file synthesis is cancelled separately inside the native queue when the module tears a job down.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+| --- | --- |
+| `LocalTtsUnavailableError` / `isAvailable === false` | App not rebuilt after install, or Expo modules missing in a bare app |
+| `synthesizeUtterancesToFile is not available in this native build` | Stale binary — rebuild after upgrading the package |
+| Empty or truncated WAV after batching | Upgrade to a build that includes the chunk-aware `concatWavFiles` implementation |
+| No word progress on Android | Device below API 26 |
+| Sounds different from Settings (iOS) | Try `qualityMode: true` and a premium voice identifier from `getVoices()` |
+
+---
+
+## Development
+
+```bash
+npm install
+npm run build     # emits dist/
+npm run typecheck
 ```
 
----
-
-## API Reference
-
-### Functions
-
-| Function | Returns | Description |
-|----------|---------|-------------|
-| `speak(options)` | `Promise<void>` | Speak text aloud. Resolves when speech finishes. |
-| `synthesizeToFile(options)` | `Promise<void>` | Write synthesized speech to an audio file. |
-| `getVoices()` | `Promise<VoiceInfo[]>` | List all available TTS voices on the device. |
-| `stop()` | `void` | Immediately stop any in-progress speech. |
-| `isSpeaking()` | `boolean` | Check if the TTS engine is currently speaking. |
-| `isAvailable` | `boolean` | Whether the native module is loaded. |
-| `useLocalTts()` | hook state + actions | React hook for speech/synthesis UI state. |
-
-### `SpeakOptions`
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `text` | `string` | — | **Required.** Text to speak. |
-| `rate` | `number` | `1.0` | Speech rate multiplier (0.5 = half, 2.0 = double). |
-| `pitch` | `number` | `1.0` | Pitch multiplier (0.5 = lower, 2.0 = higher). |
-| `language` | `string` | device default | BCP-47 language tag (e.g. `"en-US"`). |
-| `voice` | `string` | — | Platform-specific voice identifier. Overrides `language`. |
-| `qualityMode` | `boolean` | `true` | **iOS:** `true` = `.default` + `usesApplicationAudioSession = false`; `false` = `.spokenAudio` + app session. No-op on Android. |
-
-### `SynthesizeOptions`
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `text` | `string` | — | **Required.** Text to synthesize. |
-| `filePath` | `string` | — | **Required.** Absolute path ending in `.wav`. |
-| `rate` | `number` | `1.0` | Speech rate multiplier (0.5 = half, 2.0 = double). |
-| `pitch` | `number` | `1.0` | Pitch multiplier (0.5 = lower, 2.0 = higher). |
-| `language` | `string` | device default | BCP-47 language tag. |
-| `voice` | `string` | — | Platform-specific voice identifier. |
-| `qualityMode` | `boolean` | `false` | **iOS:** same routing as speak; default `false` for faster book conversion. No-op on Android. |
-
-### `VoiceInfo` (alias: `TtsVoice`)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `identifier` | `string` | Voice identifier to pass to `SpeakOptions.voice`. |
-| `name` | `string` | Human-readable voice name. |
-| `language` | `string` | BCP-47 language tag. |
-| `quality` | `"default" \| "enhanced" \| "premium"` | Voice quality tier. |
-
-### Event Subscriptions
-
-| Function | Event Payload | Description |
-|----------|--------------|-------------|
-| `onSpeechStart(cb)` | `void` | Fires when speech begins. |
-| `onSpeechDone(cb)` | `void` | Fires when speech finishes or is cancelled. |
-| `onSpeechProgress(cb)` | `{ charIndex, charLength }` | Fires for each word as it's spoken. |
-| `onSpeechError(cb)` | `{ message }` | Fires on speech engine errors. |
-
-All event functions return `{ remove: () => void }` to unsubscribe.
-
----
-
-## Platform Notes
-
-### iOS
-- Uses `AVSpeechSynthesizer` for speech and `AVSpeechSynthesizer.write(_:toBufferCallback:)` (iOS 13+) for file synthesis.
-- Activates `AVAudioSession` with `.playback` before synthesis; mode is `.default` or `.spokenAudio` based on `qualityMode`.
-- File synthesis streams buffers as Int16 mono into a `.wav` (`filePath` must end with `.wav`).
-- Voice quality tiers map to `AVSpeechSynthesisVoiceQuality` (`.default`, `.enhanced`, `.premium`).
-
-### Android
-- Uses `android.speech.tts.TextToSpeech` for speech and `TextToSpeech.synthesizeToFile()` for file synthesis.
-- Configures `AudioAttributes` (`USAGE_MEDIA` / `CONTENT_TYPE_SPEECH`) and `STREAM_MUSIC` params.
-- File synthesis writes `.wav` files natively.
-- Word-level progress requires API 26+ (`onRangeStart`); on older devices only start/done events fire.
-- The TTS engine initializes asynchronously on module creation; functions wait up to 5 seconds for initialization.
+`main` points at `dist/`. After changing TypeScript, run `build` before the consuming app can see new JS exports. Swift / Kotlin changes still need a native rebuild of the app.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).

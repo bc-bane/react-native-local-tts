@@ -46,6 +46,10 @@ export type UseLocalTtsResult = {
  * React hook that wires speech lifecycle events and synthesis status into
  * local component state.
  *
+ * Subscribes to start / done / progress / error while the component is mounted.
+ * Useful for simple speak buttons and progress UI; for batch file conversion
+ * prefer calling `synthesizeUtterancesToFile` / `concatWavFiles` directly.
+ *
  * @example
  * ```tsx
  * const { speak, isSpeaking, progress, synthesizeToFile, isSynthesizing } = useLocalTts();

@@ -1,7 +1,7 @@
 {
   "name": "react-native-local-tts",
-  "version": "0.1.7",
-  "description": "Expo module for local text-to-speech synthesis on iOS and Android. Speak text aloud, synthesize to audio files, list available voices, and receive word-level progress events.",
+  "version": "0.1.8",
+  "description": "On-device text-to-speech for React Native (iOS AVSpeechSynthesizer, Android TextToSpeech). Speak, write WAV files, list voices, word-level progress.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "source": "src/index.ts",
@@ -28,16 +28,14 @@
     "prepublishOnly": "rm -rf dist && tsc"
   },
   "keywords": [
-    "expo-module",
-    "expo",
+    "react-native",
     "tts",
     "text-to-speech",
     "speech",
-    "synthesis",
-    "voice",
-    "react-native",
+    "expo-module",
     "ios",
-    "android"
+    "android",
+    "wav"
   ],
   "repository": {
     "type": "git",

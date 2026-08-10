@@ -31,7 +31,7 @@ export type SpeakOptions = {
    */
   language?: string;
   /**
-   * Platform-specific voice identifier.
+   * Platform-specific voice identifier from `getVoices()`.
    * - **iOS**: `AVSpeechSynthesisVoice.identifier` (e.g. `"com.apple.voice.compact.en-US.Samantha"`).
    * - **Android**: `Voice.getName()` (e.g. `"en-us-x-sfg#male_1-local"`).
    * If provided, overrides `language`.
@@ -39,10 +39,10 @@ export type SpeakOptions = {
   voice?: string;
   /**
    * iOS audio routing for natural vs faster synthesis.
-   * - `true` — `AVAudioSession` `.default` + `usesApplicationAudioSession = false` (better neural/premium timbre).
-   * - `false` — `.spokenAudio` + `usesApplicationAudioSession = true` (faster / more compatible).
+   * - `true` — `AVAudioSession` `.default` (closer to System Settings / neural voice timbre).
+   * - `false` — `.spokenAudio` (usually faster / more compatible for bulk work).
    * No-op on Android.
-   * @default true for {@link speak}
+   * @default true for {@link SpeakOptions} used with `speak()`
    */
   qualityMode?: boolean;
 };
@@ -55,7 +55,7 @@ export type SynthesizeOptions = {
   text: string;
   /**
    * Absolute filesystem path for the output audio file.
-   * Must end with `.wav` (Int16 mono PCM). The extension selects the container on iOS.
+   * Must end with `.wav` (Int16 mono PCM). The `file://` prefix is optional.
    */
   filePath: string;
   /**
@@ -78,12 +78,90 @@ export type SynthesizeOptions = {
   voice?: string;
   /**
    * iOS audio routing for natural vs faster offline synthesis.
-   * - `true` — `AVAudioSession` `.default` + `usesApplicationAudioSession = false` (better neural/premium timbre; slower).
-   * - `false` — `.spokenAudio` + `usesApplicationAudioSession = true` (faster book conversion).
+   * Same meaning as {@link SpeakOptions.qualityMode}.
    * No-op on Android.
-   * @default false for {@link synthesizeToFile}
+   * @default false for file synthesis APIs
    */
   qualityMode?: boolean;
+};
+
+/**
+ * One utterance in a streamed multi-utterance synthesis job.
+ * Prefer this shape (via `synthesizeUtterancesToFile`) for long text so native
+ * code can append silence between segments without holding full-chapter PCM in JS.
+ */
+export type SynthesizeUtterance = {
+  /** Text for this segment. */
+  text: string;
+  /**
+   * Speech rate multiplier for this utterance only.
+   * @default 1.0
+   */
+  rate?: number;
+  /**
+   * Pitch multiplier for this utterance only.
+   * @default 1.0
+   */
+  pitch?: number;
+  /**
+   * Silence inserted after this utterance in the same output file, in milliseconds.
+   * @default 0
+   */
+  trailingSilenceMs?: number;
+};
+
+/**
+ * Options for synthesizing many utterances into a single WAV, streaming to disk.
+ * Prefer this for book / chapter conversion — avoids holding full-chapter PCM in JS RAM.
+ */
+export type SynthesizeUtterancesOptions = {
+  /** Segments spoken in order into one file. */
+  utterances: SynthesizeUtterance[];
+  /**
+   * Absolute filesystem path for the output audio file.
+   * Must end with `.wav`. The `file://` prefix is optional.
+   */
+  filePath: string;
+  /**
+   * BCP-47 language tag applied to the job when `voice` is omitted.
+   */
+  language?: string;
+  /**
+   * Platform-specific voice identifier. Overrides `language` if provided.
+   */
+  voice?: string;
+  /**
+   * iOS audio routing. Same meaning as {@link SpeakOptions.qualityMode}.
+   * @default false
+   */
+  qualityMode?: boolean;
+};
+
+/**
+ * Options for streaming-concatenation of Int16 WAV parts into one file.
+ * Parses each file’s real `data` chunk (does not assume a classic 44-byte header).
+ */
+export type ConcatWavOptions = {
+  /** Existing WAV part paths, in play order. `file://` prefix is optional. */
+  inputPaths: string[];
+  /**
+   * Absolute destination path ending in `.wav`.
+   * `file://` prefix is optional.
+   */
+  outputPath: string;
+};
+
+/**
+ * Result metadata from native file synthesis or concat.
+ * PCM stays on disk; this is timing / format info only.
+ */
+export type SynthesizeFileResult = {
+  /** Audio length in seconds. */
+  durationSeconds: number;
+  /** Sample rate of the written PCM (Hz). */
+  sampleRate: number;
+  /** Total PCM frames written. */
+  frameCount: number;
 };
 
 /**
@@ -98,9 +176,9 @@ export type VoiceInfo = {
   language: string;
   /**
    * Voice quality tier.
-   * - `"default"` — standard/compact voice
+   * - `"default"` — standard / compact voice
    * - `"enhanced"` — higher quality, larger download (iOS)
-   * - `"premium"` — neural/network voice if available
+   * - `"premium"` — neural / network voice when available
    */
   quality: "default" | "enhanced" | "premium";
 };
