@@ -307,7 +307,9 @@ public class LocalTtsModule: Module, @unchecked Sendable {
   private func configureFileAudioSession() {
     do {
       let audioSession = AVAudioSession.sharedInstance()
-      try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+      // Prefer .default over .spokenAudio for offline write: spokenAudio engages
+      // accessibility EQ/NR that makes premium/neural voices sound robotic.
+      try audioSession.setCategory(.playback, mode: .default, options: [.duckOthers])
       try audioSession.setPreferredSampleRate(44_100)
       try audioSession.setActive(true)
     } catch {
