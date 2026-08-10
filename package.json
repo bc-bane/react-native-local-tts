@@ -49,6 +49,9 @@
     "url": "https://github.com/bc-bane/react-native-local-tts/issues"
   },
   "homepage": "https://github.com/bc-bane/react-native-local-tts#readme",
+  "engines": {
+    "node": ">=20.19.4"
+  },
   "expo": {
     "autoInstall": true,
     "name": "LocalTtsModule"
