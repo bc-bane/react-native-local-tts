@@ -122,7 +122,7 @@ export async function speak(options: SpeakOptions): Promise<void> {
  * engine. The promise resolves once the entire file has been written.
  *
  * - **iOS**: Uses `AVSpeechSynthesizer.write(_:toBufferCallback:)` to capture
- *   PCM buffers, then writes them as a `.caf` audio file via `AVAudioFile`.
+ *   PCM buffers, converts them to Int16 mono, then writes a `.wav` via `AVAudioFile`.
  * - **Android**: Uses `TextToSpeech.synthesizeToFile()` which writes a `.wav`.
  *
  * @throws {LocalTtsUnavailableError} If the native module is not installed.

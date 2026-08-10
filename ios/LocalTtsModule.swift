@@ -7,7 +7,13 @@ import AVFoundation
 
 public class LocalTtsModule: Module, @unchecked Sendable {
   private let synthQueue = DispatchQueue(label: "expo.modules.localtts.synth")
-  private var synthesizer = AVSpeechSynthesizer()
+  /// System TTS path (not the app session) avoids the spoken-audio accessibility graph
+  /// that degrades neural / premium voices on real devices.
+  private var synthesizer: AVSpeechSynthesizer = {
+    let synth = AVSpeechSynthesizer()
+    synth.usesApplicationAudioSession = false
+    return synth
+  }()
   private var speakDelegate: SpeechDelegate?
   /// Keeps the file synthesizer alive for the duration of `write(_:toBufferCallback:)`.
   /// Cleared on completion so the callback can use `[weak fileSynthesizer]` safely.
@@ -91,6 +97,7 @@ public class LocalTtsModule: Module, @unchecked Sendable {
         }
 
         let fileSynthesizer = AVSpeechSynthesizer()
+        fileSynthesizer.usesApplicationAudioSession = false
         // Module-owned strong ref keeps the synthesizer alive while the callback
         // only holds `[weak fileSynthesizer]` (no synthesizer ↔ callback cycle).
         self.activeFileSynthesizer = fileSynthesizer
@@ -132,15 +139,26 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 
           autoreleasepool {
             do {
+              // Always write Int16 mono WAV. AVSpeech buffers are often Float32
+              // CAF-oriented formats that miniaudio (and many players) cannot decode.
+              guard let wavBuffer = Self.convertToInt16MonoWavBuffer(pcmBuffer) else {
+                writeError = NSError(
+                  domain: "LocalTts",
+                  code: -1,
+                  userInfo: [
+                    NSLocalizedDescriptionKey: "Failed to convert TTS PCM buffer to Int16 WAV",
+                  ]
+                )
+                return
+              }
+
               if audioFile == nil {
                 audioFile = try AVAudioFile(
                   forWriting: fileURL,
-                  settings: pcmBuffer.format.settings,
-                  commonFormat: pcmBuffer.format.commonFormat,
-                  interleaved: pcmBuffer.format.isInterleaved
+                  settings: wavBuffer.format.settings
                 )
               }
-              try audioFile?.write(from: pcmBuffer)
+              try audioFile?.write(from: wavBuffer)
             } catch {
               writeError = error
             }
@@ -160,17 +178,11 @@ public class LocalTtsModule: Module, @unchecked Sendable {
     // ----- getVoices -----
     AsyncFunction("getVoices") { () -> [[String: Any]] in
       AVSpeechSynthesisVoice.speechVoices().map { voice in
-        var quality = "default"
-        if #available(iOS 16.0, *), voice.quality == .premium {
-          quality = "premium"
-        } else if #available(iOS 9.0, *), voice.quality == .enhanced {
-          quality = "enhanced"
-        }
-        return [
+        [
           "identifier": voice.identifier,
           "name": voice.name,
           "language": voice.language,
-          "quality": quality
+          "quality": self.reportedQuality(for: voice)
         ]
       }
     }
@@ -190,17 +202,116 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 
   // MARK: - Helpers
 
+  /// Converts an AVSpeech PCM buffer to interleaved Int16 mono for WAV output.
+  private static func convertToInt16MonoWavBuffer(
+    _ buffer: AVAudioPCMBuffer
+  ) -> AVAudioPCMBuffer? {
+    let frames = Int(buffer.frameLength)
+    guard frames > 0 else { return nil }
+
+    guard
+      let outFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: buffer.format.sampleRate,
+        channels: 1,
+        interleaved: true
+      ),
+      let out = AVAudioPCMBuffer(
+        pcmFormat: outFormat,
+        frameCapacity: AVAudioFrameCount(frames)
+      ),
+      let dst = out.int16ChannelData?[0]
+    else {
+      return nil
+    }
+
+    out.frameLength = AVAudioFrameCount(frames)
+    let channels = Int(buffer.format.channelCount)
+    guard channels > 0 else { return nil }
+
+    if buffer.format.commonFormat == .pcmFormatFloat32,
+      let src = buffer.floatChannelData
+    {
+      for i in 0..<frames {
+        var sample: Float = 0
+        for ch in 0..<channels {
+          sample += src[ch][i]
+        }
+        if channels > 1 {
+          sample /= Float(channels)
+        }
+        let clipped = max(-1.0 as Float, min(1.0 as Float, sample))
+        dst[i] = Int16((clipped * Float(Int16.max)).rounded())
+      }
+      return out
+    }
+
+    if buffer.format.commonFormat == .pcmFormatInt16,
+      let src = buffer.int16ChannelData
+    {
+      if channels == 1 {
+        memcpy(dst, src[0], frames * MemoryLayout<Int16>.size)
+      } else {
+        for i in 0..<frames {
+          var sum = 0
+          for ch in 0..<channels {
+            sum += Int(src[ch][i])
+          }
+          dst[i] = Int16(sum / channels)
+        }
+      }
+      return out
+    }
+
+    // Fallback for uncommon formats (e.g. Int32): convert via AVAudioConverter.
+    guard let converter = AVAudioConverter(from: buffer.format, to: outFormat) else {
+      return nil
+    }
+    var converted = false
+    var convertError: NSError?
+    let status = converter.convert(to: out, error: &convertError) { _, outStatus in
+      if converted {
+        outStatus.pointee = .noDataNow
+        return nil
+      }
+      converted = true
+      outStatus.pointee = .haveData
+      return buffer
+    }
+    guard convertError == nil, status != .error else { return nil }
+    return out
+  }
+
   private func configureAudioSessionIfNeeded() {
     do {
       let audioSession = AVAudioSession.sharedInstance()
-      // .playback + .spokenAudio keeps synthesis off the 16 kHz telephony path.
-      try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
-      // Request native media sample rate before activation (hardware may still negotiate).
+      // .playback + .default: play in silent mode without the .spokenAudio accessibility
+      // EQ/NR graph that makes neural voices sound robotic on real devices.
+      // Synthesizers use usesApplicationAudioSession = false so speech still rides the
+      // system TTS path (matching Settings previews) while this session stays available
+      // for other app audio.
+      try audioSession.setCategory(.playback, mode: .default, options: [.duckOthers])
       try audioSession.setPreferredSampleRate(44_100)
       try audioSession.setActive(true)
     } catch {
       print("[LocalTtsModule] AudioSession configuration warning: \(error.localizedDescription)")
     }
+  }
+
+  /// Maps Apple quality + identifier footprint to the labels the JS layer buckets on.
+  /// `super-compact` identifiers are the highest-quality on-device neural voices and
+  /// often report as `.default` in the API enum — surface them as premium.
+  private func reportedQuality(for voice: AVSpeechSynthesisVoice) -> String {
+    if voice.identifier.localizedCaseInsensitiveContains("super-compact") {
+      return "premium"
+    }
+    if #available(iOS 16.0, *), voice.quality == .premium {
+      return "premium"
+    }
+    if #available(iOS 9.0, *), voice.quality == .enhanced {
+      return "enhanced"
+    }
+    return "default"
   }
 
   private func buildUtterance(_ options: SpeakOptions) -> AVSpeechUtterance {
@@ -252,7 +363,8 @@ public class LocalTtsModule: Module, @unchecked Sendable {
       print("[LocalTtsModule] Specified voice identifier '\(voice)' not found, attempting language fallback.")
     }
 
-    // Priority 2: best installed voice for language (premium > enhanced > default)
+    // Priority 2: best installed voice for language
+    // (super-compact > premium > enhanced > default)
     if !language.isEmpty {
       utterance.voice = bestVoice(forLanguage: language)
     }
@@ -278,6 +390,10 @@ public class LocalTtsModule: Module, @unchecked Sendable {
   }
 
   private func voiceQualityRank(_ voice: AVSpeechSynthesisVoice) -> Int {
+    // Super-compact neural footprints outrank Apple's quality enum tiers.
+    if voice.identifier.localizedCaseInsensitiveContains("super-compact") {
+      return 4
+    }
     if #available(iOS 16.0, *) {
       if voice.quality == .premium { return 3 }
     }

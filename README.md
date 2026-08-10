@@ -7,7 +7,7 @@
 ## Features
 
 - **Speak text aloud** via `AVSpeechSynthesizer` (iOS) and `TextToSpeech` (Android)
-- **Synthesize text to audio files** (`.caf` on iOS, `.wav` on Android)
+- **Synthesize text to audio files** (`.wav` on iOS and Android)
 - **List available voices** with quality tiers and language tags
 - **Word-level progress events** (`onSpeechProgress`) for live UI updates
 - **Speech lifecycle events** — start, done, error
@@ -92,7 +92,7 @@ function Reader() {
         onPress={() =>
           synthesizeToFile({
             text: 'Offline chapter',
-            filePath: `${FileSystem.documentDirectory}chapter.caf`,
+            filePath: `${FileSystem.documentDirectory}chapter.wav`,
           })
         }
       />
@@ -189,7 +189,7 @@ All event functions return `{ remove: () => void }` to unsubscribe.
 ### iOS
 - Uses `AVSpeechSynthesizer` for speech and `AVSpeechSynthesizer.write(_:toBufferCallback:)` (iOS 13+) for file synthesis.
 - Activates `AVAudioSession` with `.playback` / `.spokenAudio` before synthesis.
-- File synthesis writes `.caf` (Core Audio Format) with PCM data via `AVAudioFile`.
+- File synthesis converts buffers to Int16 mono and writes `.wav` via `AVAudioFile`.
 - Voice quality tiers map to `AVSpeechSynthesisVoiceQuality` (`.default`, `.enhanced`, `.premium`).
 
 ### Android

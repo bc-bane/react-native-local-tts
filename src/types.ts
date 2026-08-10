@@ -47,8 +47,8 @@ export type SynthesizeOptions = {
   text: string;
   /**
    * Absolute file path on the device where the audio will be written.
-   * - **iOS**: Writes a `.caf` (Core Audio Format) file with PCM audio.
-   * - **Android**: Writes a `.wav` file.
+   * Writes a `.wav` file with Int16 PCM on both iOS and Android.
+   * Prefer a `.wav` path extension so `AVAudioFile` selects the WAV container.
    */
   filePath: string;
   /**
