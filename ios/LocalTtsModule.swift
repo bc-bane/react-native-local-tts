@@ -1,27 +1,59 @@
-import Accelerate
 import ExpoModulesCore
 import AVFoundation
 
 // ---------------------------------------------------------------------------
 // Expo Module Definition
+//
+// Threading contract (Expo Modules + AVSpeechSynthesizer):
+//
+// 1. Expo `AsyncFunction` runs on `expo.modules.AsyncFunctionQueue` (serial).
+//    Return immediately; resolve the Promise later from a callback.
+//
+// 2. `AVSpeechSynthesizer.write` delivers buffers via the main run loop.
+//    Calling `write` from a background thread can internally `dispatch_sync`
+//    to main and then wait for those same main-queue buffers → permanent
+//    deadlock / frozen UI. Always start `write` with `DispatchQueue.main.async`
+//    and never semaphore-wait around it.
+//
+// 3. Creating/touching `AVSpeechSynthesizer` / voice lookup triggers XPC and
+//    can stall the calling thread. Prefer a long-lived file synthesizer and
+//    avoid doing that work on AsyncFunctionQueue.
+//
+// 4. Offline `write` keeps default `usesApplicationAudioSession == true`.
+//    `false` is only for live `speak()` preview quality.
+//
+// 5. `AVAudioFile` must use the buffer's own commonFormat + isInterleaved.
 // ---------------------------------------------------------------------------
 
 public class LocalTtsModule: Module, @unchecked Sendable {
-  private let synthQueue = DispatchQueue(label: "expo.modules.localtts.synth")
-  /// System TTS path (not the app session) avoids the spoken-audio accessibility graph
-  /// that degrades neural / premium voices on real devices.
-  private var synthesizer: AVSpeechSynthesizer = {
+  private let speakQueue = DispatchQueue(label: "expo.modules.localtts.speak")
+  private let fileJobQueue = DispatchQueue(label: "expo.modules.localtts.filejobs")
+
+  private var speakSynthesizer: AVSpeechSynthesizer = {
     let synth = AVSpeechSynthesizer()
     synth.usesApplicationAudioSession = false
     return synth
   }()
   private var speakDelegate: SpeechDelegate?
-  /// Keeps the file synthesizer alive for the duration of `write(_:toBufferCallback:)`.
-  /// Cleared on completion so the callback can use `[weak fileSynthesizer]` safely.
-  private var activeFileSynthesizer: AVSpeechSynthesizer?
+
+  /// Long-lived offline synthesizer. Created lazily on a utility queue to avoid
+  /// first-use XPC stalls on AsyncFunctionQueue / main during conversion.
+  private var fileSynthesizer: AVSpeechSynthesizer?
+  private let fileSynthesizerLock = NSLock()
+
+  private var fileJobRunning = false
+  private var pendingFileJobs: [(SynthesizeOptions, Promise)] = []
 
   public func definition() -> ModuleDefinition {
     Name("LocalTtsModule")
+
+    OnCreate {
+      // Pre-warm voice catalog + file synthesizer off the hot path.
+      DispatchQueue.global(qos: .utility).async { [weak self] in
+        _ = AVSpeechSynthesisVoice.speechVoices()
+        self?.ensureFileSynthesizer()
+      }
+    }
 
     Events(
       "onSpeechStart",
@@ -30,14 +62,12 @@ public class LocalTtsModule: Module, @unchecked Sendable {
       "onSpeechProgress"
     )
 
-    // ----- speak -----
     AsyncFunction("speak") { (options: SpeakOptions, promise: Promise) in
-      self.synthQueue.async {
-        self.configureAudioSessionIfNeeded()
+      self.speakQueue.async {
+        self.configureSpeakAudioSession()
 
-        // Cancel any in-flight utterance so its delegate can settle before we replace it.
-        if self.synthesizer.isSpeaking {
-          self.synthesizer.stopSpeaking(at: .immediate)
+        if self.speakSynthesizer.isSpeaking {
+          self.speakSynthesizer.stopSpeaking(at: .immediate)
         }
 
         let utterance = self.buildUtterance(options)
@@ -51,8 +81,7 @@ public class LocalTtsModule: Module, @unchecked Sendable {
               "charLength": charLength
             ])
           },
-          onFinish: { [weak self] in
-            self?.sendEvent("onSpeechDone", [:])
+          onFinish: {
             promise.resolve(nil)
           },
           onError: { [weak self] message in
@@ -61,131 +90,38 @@ public class LocalTtsModule: Module, @unchecked Sendable {
           }
         )
         self.speakDelegate = delegate
-        self.synthesizer.delegate = delegate
-        self.synthesizer.speak(utterance)
+        self.speakSynthesizer.delegate = delegate
+        self.speakSynthesizer.speak(utterance)
       }
     }
 
-    // ----- synthesizeToFile -----
     AsyncFunction("synthesizeToFile") { (options: SynthesizeOptions, promise: Promise) in
-      self.synthQueue.async {
-        guard #available(iOS 13.0, *) else {
-          promise.reject("ERR_TTS_UNSUPPORTED", "synthesizeToFile requires iOS 13+")
-          return
-        }
+      guard #available(iOS 13.0, *) else {
+        promise.reject("ERR_TTS_UNSUPPORTED", "synthesizeToFile requires iOS 13+")
+        return
+      }
 
-        if options.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-          promise.reject("ERR_TTS_FILE", "synthesizeToFile requires non-empty text")
-          return
-        }
+      if options.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        promise.reject("ERR_TTS_FILE", "synthesizeToFile requires non-empty text")
+        return
+      }
 
-        let fileURL = URL(fileURLWithPath: options.filePath)
-        guard fileURL.pathExtension.lowercased() == "wav" else {
-          promise.reject(
-            "ERR_TTS_FILE_PATH",
-            "synthesizeToFile requires a .wav filePath; AVAudioFile selects the container from the extension"
-          )
-          return
-        }
+      let fileURL = URL(fileURLWithPath: options.filePath)
+      guard fileURL.pathExtension.lowercased() == "wav" else {
+        promise.reject(
+          "ERR_TTS_FILE_PATH",
+          "synthesizeToFile requires a .wav filePath"
+        )
+        return
+      }
 
-        self.configureAudioSessionIfNeeded()
-
-        let utterance = self.buildUtterance(options)
-
-        // Ensure parent directory exists; overwrite any prior file at this path.
-        let dir = fileURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try? FileManager.default.removeItem(at: fileURL)
-
-        let sink = Int16MonoWavSink(fileURL: fileURL)
-        var writeError: Error?
-        var didSettle = false
-        let settleLock = NSLock()
-
-        func settle(_ body: () -> Void) {
-          settleLock.lock()
-          defer { settleLock.unlock() }
-          guard !didSettle else { return }
-          didSettle = true
-          body()
-        }
-
-        let fileSynthesizer = AVSpeechSynthesizer()
-        fileSynthesizer.usesApplicationAudioSession = false
-        // Module-owned strong ref keeps the synthesizer alive while the callback
-        // only holds `[weak fileSynthesizer]` (no synthesizer ↔ callback cycle).
-        self.activeFileSynthesizer = fileSynthesizer
-
-        // Block this serial queue until synthesis finishes so concurrent
-        // synthesizeToFile calls cannot interleave PCM writes / file headers.
-        let done = DispatchSemaphore(value: 0)
-
-        func failAndStop(_ error: Error) {
-          // Settle immediately: stopSpeaking does not always deliver a terminal
-          // buffer on every iOS version, and we must not block the synth queue.
-          writeError = error
-          settle {
-            promise.reject("ERR_TTS_FILE_WRITE", error.localizedDescription)
-            self.activeFileSynthesizer = nil
-          }
-          fileSynthesizer.stopSpeaking(at: .immediate)
-          done.signal()
-        }
-
-        fileSynthesizer.write(utterance) { [weak self, weak fileSynthesizer] buffer in
-          guard let pcmBuffer = buffer as? AVAudioPCMBuffer else { return }
-          _ = fileSynthesizer // intentional weak capture (module retains via activeFileSynthesizer)
-
-          // Ignore further buffers after the first hard failure.
-          if writeError != nil {
-            return
-          }
-
-          // iOS ≤16 ends with frameLength == 0. iOS 17+ Float32 paths often end
-          // with a trailing buffer of frameLength == 1 (silent). Treat both as done.
-          let isTerminalBuffer: Bool
-          if pcmBuffer.format.commonFormat == .pcmFormatFloat32 {
-            isTerminalBuffer = pcmBuffer.frameLength <= 1
-          } else {
-            isTerminalBuffer = pcmBuffer.frameLength == 0
-          }
-
-          if isTerminalBuffer {
-            settle {
-              if !sink.didWriteAudio {
-                promise.reject(
-                  "ERR_TTS_FILE_EMPTY",
-                  "synthesizeToFile produced no audio buffers"
-                )
-              } else {
-                promise.resolve(nil)
-              }
-              self?.activeFileSynthesizer = nil
-            }
-            done.signal()
-            return
-          }
-
-          autoreleasepool {
-            do {
-              try sink.write(pcmBuffer)
-            } catch {
-              failAndStop(error)
-            }
-          }
-        }
-
-        if done.wait(timeout: .now() + 600) == .timedOut {
-          settle {
-            self.activeFileSynthesizer?.stopSpeaking(at: .immediate)
-            self.activeFileSynthesizer = nil
-            promise.reject("ERR_TTS_FILE_TIMEOUT", "synthesizeToFile timed out after 600s")
-          }
-        }
+      // Return immediately from AsyncFunctionQueue — never block it.
+      self.fileJobQueue.async {
+        self.pendingFileJobs.append((options, promise))
+        self.startNextFileJobIfNeeded()
       }
     }
 
-    // ----- getVoices -----
     AsyncFunction("getVoices") { () -> [[String: Any]] in
       AVSpeechSynthesisVoice.speechVoices().map { voice in
         [
@@ -197,40 +133,190 @@ public class LocalTtsModule: Module, @unchecked Sendable {
       }
     }
 
-    // ----- stop -----
     Function("stop") {
-      self.synthesizer.stopSpeaking(at: .immediate)
-      // Also cancel in-flight file synthesis (write(_:toBufferCallback:)).
-      self.activeFileSynthesizer?.stopSpeaking(at: .immediate)
+      self.speakSynthesizer.stopSpeaking(at: .immediate)
+      self.fileSynthesizerLock.lock()
+      self.fileSynthesizer?.stopSpeaking(at: .immediate)
+      self.fileSynthesizerLock.unlock()
     }
 
-    // ----- isSpeaking -----
     Function("isSpeaking") { () -> Bool in
-      self.synthesizer.isSpeaking
+      self.speakSynthesizer.isSpeaking
     }
   }
 
-  // MARK: - Helpers
+  // MARK: - File synthesis
 
-  private func configureAudioSessionIfNeeded() {
+  private func ensureFileSynthesizer() -> AVSpeechSynthesizer {
+    fileSynthesizerLock.lock()
+    defer { fileSynthesizerLock.unlock() }
+    if let fileSynthesizer {
+      return fileSynthesizer
+    }
+    let synth = AVSpeechSynthesizer()
+    // Default usesApplicationAudioSession (= true) required for write(_:).
+    fileSynthesizer = synth
+    return synth
+  }
+
+  private func startNextFileJobIfNeeded() {
+    guard !fileJobRunning, !pendingFileJobs.isEmpty else { return }
+    fileJobRunning = true
+    let (options, promise) = pendingFileJobs.removeFirst()
+
+    // Prepare file URL / utterance off main (may touch voice XPC).
+    DispatchQueue.global(qos: .utility).async { [weak self] in
+      guard let self else { return }
+
+      let fileURL = URL(fileURLWithPath: options.filePath)
+      let dir = fileURL.deletingLastPathComponent()
+      try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+      try? FileManager.default.removeItem(at: fileURL)
+
+      let utterance = self.buildUtterance(options)
+      let synth = self.ensureFileSynthesizer()
+
+      print(
+        "[LocalTtsModule] synthesizeToFile enqueue chars=\(options.text.count) voice=\(options.voice) file=\(fileURL.lastPathComponent)"
+      )
+
+      // CRITICAL: start write on the main queue asynchronously. Do not call write
+      // from a background thread (deadlock risk with main-run-loop buffer delivery).
+      DispatchQueue.main.async {
+        self.beginWriteOnMain(
+          synthesizer: synth,
+          utterance: utterance,
+          fileURL: fileURL,
+          promise: promise
+        )
+      }
+    }
+  }
+
+  private func finishFileJob() {
+    fileJobQueue.async { [weak self] in
+      guard let self else { return }
+      self.fileJobRunning = false
+      self.startNextFileJobIfNeeded()
+    }
+  }
+
+  /// Must be called on the main queue.
+  private func beginWriteOnMain(
+    synthesizer: AVSpeechSynthesizer,
+    utterance: AVSpeechUtterance,
+    fileURL: URL,
+    promise: Promise
+  ) {
+    assert(Thread.isMainThread)
+
+    configureFileAudioSession()
+
+    if synthesizer.isSpeaking {
+      synthesizer.stopSpeaking(at: .immediate)
+    }
+
+    var writeError: Error?
+    var didSettle = false
+    let settleLock = NSLock()
+
+    func settle(_ body: () -> Void) {
+      settleLock.lock()
+      defer { settleLock.unlock() }
+      guard !didSettle else { return }
+      didSettle = true
+      body()
+      self.finishFileJob()
+    }
+
+    let timeoutWork = DispatchWorkItem {
+      print("[LocalTtsModule] synthesizeToFile TIMEOUT \(fileURL.lastPathComponent)")
+      settle {
+        synthesizer.stopSpeaking(at: .immediate)
+        promise.reject("ERR_TTS_FILE_TIMEOUT", "synthesizeToFile timed out after 120s")
+      }
+    }
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 120, execute: timeoutWork)
+
+    print("[LocalTtsModule] synthesizeToFile START on main \(fileURL.lastPathComponent)")
+
+    // miniaudio (react-native-audio-api) cannot decode Float32 WAV that AVSpeech
+    // often emits on modern iOS — normalize to Int16 mono PCM WAV.
+    let sink = Int16MonoWavSink(fileURL: fileURL)
+
+    // Returns immediately; main run loop delivers buffers between turns.
+    synthesizer.write(utterance) { buffer in
+      guard let pcmBuffer = buffer as? AVAudioPCMBuffer else { return }
+
+      if writeError != nil {
+        return
+      }
+
+      let isTerminalBuffer: Bool
+      if pcmBuffer.format.commonFormat == .pcmFormatFloat32 {
+        isTerminalBuffer = pcmBuffer.frameLength <= 1
+      } else {
+        isTerminalBuffer = pcmBuffer.frameLength == 0
+      }
+
+      if isTerminalBuffer {
+        timeoutWork.cancel()
+        // Finalize WAV header before JS decodeAudioData opens the path.
+        sink.close()
+        settle {
+          if !sink.didWriteAudio {
+            promise.reject(
+              "ERR_TTS_FILE_EMPTY",
+              "synthesizeToFile produced no audio buffers"
+            )
+          } else {
+            print("[LocalTtsModule] synthesizeToFile OK \(fileURL.lastPathComponent)")
+            promise.resolve(nil)
+          }
+        }
+        return
+      }
+
+      do {
+        try sink.write(pcmBuffer)
+      } catch {
+        writeError = error
+        timeoutWork.cancel()
+        synthesizer.stopSpeaking(at: .immediate)
+        sink.close()
+        settle {
+          promise.reject("ERR_TTS_FILE_WRITE", error.localizedDescription)
+        }
+      }
+    }
+  }
+
+  // MARK: - Audio sessions
+
+  private func configureSpeakAudioSession() {
     do {
       let audioSession = AVAudioSession.sharedInstance()
-      // .playback + .default: play in silent mode without the .spokenAudio accessibility
-      // EQ/NR graph that makes neural voices sound robotic on real devices.
-      // Synthesizers use usesApplicationAudioSession = false so speech still rides the
-      // system TTS path (matching Settings previews) while this session stays available
-      // for other app audio.
       try audioSession.setCategory(.playback, mode: .default, options: [.duckOthers])
       try audioSession.setPreferredSampleRate(44_100)
       try audioSession.setActive(true)
     } catch {
-      print("[LocalTtsModule] AudioSession configuration warning: \(error.localizedDescription)")
+      print("[LocalTtsModule] Speak AudioSession warning: \(error.localizedDescription)")
     }
   }
 
-  /// Maps Apple quality + identifier footprint to the labels the JS layer buckets on.
-  /// `super-compact` identifiers are the highest-quality on-device neural voices and
-  /// often report as `.default` in the API enum — surface them as premium.
+  private func configureFileAudioSession() {
+    do {
+      let audioSession = AVAudioSession.sharedInstance()
+      try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+      try audioSession.setPreferredSampleRate(44_100)
+      try audioSession.setActive(true)
+    } catch {
+      print("[LocalTtsModule] File AudioSession warning: \(error.localizedDescription)")
+    }
+  }
+
+  // MARK: - Voices / utterances
+
   private func reportedQuality(for voice: AVSpeechSynthesisVoice) -> String {
     if voice.identifier.localizedCaseInsensitiveContains("super-compact") {
       return "premium"
@@ -272,29 +358,22 @@ public class LocalTtsModule: Module, @unchecked Sendable {
     voice: String
   ) -> AVSpeechUtterance {
     let utterance = AVSpeechUtterance(string: text)
-    // Rate: map user 1.0 (normal) to AVSpeechUtteranceDefaultSpeechRate, then
-    // clamp into Apple's documented min/max speech-rate range.
     let scaledRate = AVSpeechUtteranceDefaultSpeechRate * Float(rate)
     utterance.rate = min(
       AVSpeechUtteranceMaximumSpeechRate,
       max(AVSpeechUtteranceMinimumSpeechRate, scaledRate)
     )
-    // pitchMultiplier is documented as roughly 0.5...2.0
     utterance.pitchMultiplier = min(2.0, max(0.5, Float(pitch)))
-    // Micro-pause between queued speak() utterances (not meaningful for write()).
     utterance.postUtteranceDelay = 0.12
 
-    // Priority 1: explicit voice identifier
     if !voice.isEmpty {
       if let foundVoice = AVSpeechSynthesisVoice(identifier: voice) {
         utterance.voice = foundVoice
         return utterance
       }
-      print("[LocalTtsModule] Specified voice identifier '\(voice)' not found, attempting language fallback.")
+      print("[LocalTtsModule] voice '\(voice)' not found, trying language fallback")
     }
 
-    // Priority 2: best installed voice for language
-    // (super-compact > premium > enhanced > default)
     if !language.isEmpty {
       utterance.voice = bestVoice(forLanguage: language)
     }
@@ -302,7 +381,6 @@ public class LocalTtsModule: Module, @unchecked Sendable {
     return utterance
   }
 
-  /// Picks the highest-quality installed voice matching `language` (BCP-47).
   private func bestVoice(forLanguage language: String) -> AVSpeechSynthesisVoice? {
     let voices = AVSpeechSynthesisVoice.speechVoices().filter { voice in
       voice.language.caseInsensitiveCompare(language) == .orderedSame
@@ -320,7 +398,6 @@ public class LocalTtsModule: Module, @unchecked Sendable {
   }
 
   private func voiceQualityRank(_ voice: AVSpeechSynthesisVoice) -> Int {
-    // Super-compact neural footprints outrank Apple's quality enum tiers.
     if voice.identifier.localizedCaseInsensitiveContains("super-compact") {
       return 4
     }
@@ -335,11 +412,11 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming Int16 mono WAV writer
+// Int16 mono WAV sink (miniaudio-compatible)
 // ---------------------------------------------------------------------------
 
-/// Streams AVSpeech PCM chunks to a `.wav` file as interleaved Int16 mono.
-/// Reuses output format + scratch buffers across callbacks to avoid per-chunk alloc churn.
+/// Converts AVSpeech PCM buffers to Int16 mono non-interleaved WAV.
+/// Float32 WAV from modern AVSpeech is rejected by miniaudio ("Failed to decode any frames").
 private final class Int16MonoWavSink {
   enum SinkError: LocalizedError {
     case invalidFormat
@@ -359,12 +436,17 @@ private final class Int16MonoWavSink {
   private var audioFile: AVAudioFile?
   private var outFormat: AVAudioFormat?
   private var scratch: AVAudioPCMBuffer?
-  private var converter: AVAudioConverter?
-  private var converterSourceFormatKey: String?
   private(set) var didWriteAudio = false
 
   init(fileURL: URL) {
     self.fileURL = fileURL
+  }
+
+  /// Releases `AVAudioFile` so the WAV header/data size is finalized on disk.
+  /// Must run before JS `decodeAudioData` opens the same path.
+  func close() {
+    audioFile = nil
+    scratch = nil
   }
 
   func write(_ buffer: AVAudioPCMBuffer) throws {
@@ -372,6 +454,7 @@ private final class Int16MonoWavSink {
     guard frames > 0 else { return }
 
     if outFormat == nil {
+      // Interleaved Int16 mono is the most widely supported WAV layout for miniaudio.
       guard
         let format = AVAudioFormat(
           commonFormat: .pcmFormatInt16,
@@ -383,27 +466,21 @@ private final class Int16MonoWavSink {
         throw SinkError.invalidFormat
       }
       outFormat = format
-      // Path extension is validated as .wav by the caller; settings are Linear PCM.
-      audioFile = try AVAudioFile(forWriting: fileURL, settings: format.settings)
+      audioFile = try AVAudioFile(
+        forWriting: fileURL,
+        settings: format.settings,
+        commonFormat: .pcmFormatInt16,
+        interleaved: true
+      )
     }
 
     guard let outFormat, let audioFile else {
       throw SinkError.invalidFormat
     }
 
-    // Zero-copy: already Int16 mono at the locked sample rate.
-    if buffer.format.commonFormat == .pcmFormatInt16,
-      buffer.format.channelCount == 1,
-      buffer.format.sampleRate == outFormat.sampleRate
-    {
-      try audioFile.write(from: buffer)
-      didWriteAudio = true
-      return
-    }
-
     let out = try ensureScratch(capacity: frames, format: outFormat)
     out.frameLength = AVAudioFrameCount(frames)
-    try fillInt16Mono(from: buffer, into: out, format: outFormat)
+    try fillInt16Mono(from: buffer, into: out)
     try audioFile.write(from: out)
     didWriteAudio = true
   }
@@ -424,16 +501,18 @@ private final class Int16MonoWavSink {
     return buffer
   }
 
-  private func fillInt16Mono(
-    from buffer: AVAudioPCMBuffer,
-    into out: AVAudioPCMBuffer,
-    format outFormat: AVAudioFormat
-  ) throws {
+  private func fillInt16Mono(from buffer: AVAudioPCMBuffer, into out: AVAudioPCMBuffer) throws {
     let frames = Int(buffer.frameLength)
     let channels = Int(buffer.format.channelCount)
-    guard frames > 0, channels > 0, let dst = out.int16ChannelData?[0] else {
+    guard frames > 0, channels > 0 else {
       throw SinkError.convertFailed
     }
+
+    // Interleaved mono: channel data pointers are nil — use the AudioBufferList.
+    guard let dstRaw = out.mutableAudioBufferList.pointee.mBuffers.mData else {
+      throw SinkError.convertFailed
+    }
+    let dst = dstRaw.assumingMemoryBound(to: Int16.self)
 
     if buffer.format.commonFormat == .pcmFormatFloat32,
       let src = buffer.floatChannelData
@@ -448,7 +527,7 @@ private final class Int16MonoWavSink {
           }
           sample /= Float(channels)
           let clipped = max(-1 as Float, min(1 as Float, sample))
-          dst[i] = Int16((clipped * Float(Int16.max)).rounded())
+          dst[i] = Int16(clamping: Int((clipped * Float(Int16.max)).rounded()))
         }
       }
       return
@@ -471,17 +550,12 @@ private final class Int16MonoWavSink {
       return
     }
 
-    // Uncommon formats (e.g. Int32): reuse one AVAudioConverter per source format.
-    let sourceKey =
-      "\(buffer.format.commonFormat.rawValue)-\(buffer.format.sampleRate)-\(buffer.format.channelCount)-\(buffer.format.isInterleaved)"
-    if converter == nil || converterSourceFormatKey != sourceKey {
-      guard let newConverter = AVAudioConverter(from: buffer.format, to: outFormat) else {
-        throw SinkError.convertFailed
-      }
-      converter = newConverter
-      converterSourceFormatKey = sourceKey
+    // Interleaved source or uncommon formats.
+    guard
+      let converter = AVAudioConverter(from: buffer.format, to: out.format)
+    else {
+      throw SinkError.convertFailed
     }
-    guard let converter else { throw SinkError.convertFailed }
 
     var provided = false
     var convertError: NSError?
@@ -499,26 +573,14 @@ private final class Int16MonoWavSink {
     }
   }
 
-  /// Clip → scale → quantize using Accelerate; temp floats live on the stack when possible.
   private static func convertMonoFloat32ToInt16(
     src: UnsafePointer<Float>,
     dst: UnsafeMutablePointer<Int16>,
     frames: Int
   ) {
-    let n = vDSP_Length(frames)
-    withUnsafeTemporaryAllocation(of: Float.self, capacity: frames) { temp in
-      guard let tempBase = temp.baseAddress else { return }
-      var lo: Float = -1
-      var hi: Float = 1
-      vDSP_vclip(src, 1, &lo, &hi, tempBase, 1, n)
-      var scale = Float(Int16.max)
-      vDSP_vsmul(tempBase, 1, &scale, tempBase, 1, n)
-      // Quantize with rounding. Prefer a typed loop over Accelerate overlays —
-      // vDSP.convert Float→Int16 is not consistently resolvable across SDKs, and
-      // vDSP_vfixq writes Int32 (wrong width for our Int16 CAF path).
-      for i in 0..<frames {
-        dst[i] = Int16(clamping: Int(tempBase[i].rounded(.toNearestOrAwayFromZero)))
-      }
+    for i in 0..<frames {
+      let clipped = max(-1 as Float, min(1 as Float, src[i]))
+      dst[i] = Int16(clamping: Int((clipped * Float(Int16.max)).rounded()))
     }
   }
 }
@@ -545,7 +607,7 @@ private struct SynthesizeOptions: Record {
 }
 
 // ---------------------------------------------------------------------------
-// AVSpeechSynthesizerDelegate for speech lifecycle events
+// Live speak() delegate
 // ---------------------------------------------------------------------------
 
 private class SpeechDelegate: NSObject, AVSpeechSynthesizerDelegate {

@@ -47,7 +47,7 @@ export type SynthesizeOptions = {
   text: string;
   /**
    * Absolute filesystem path for the output audio file.
-   * Must end with `.wav` (Int16 PCM). The extension selects the container on iOS.
+   * Must end with `.wav` (Int16 mono PCM). The extension selects the container on iOS.
    */
   filePath: string;
   /**

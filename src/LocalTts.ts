@@ -130,8 +130,8 @@ export async function speak(options: SpeakOptions): Promise<void> {
  * Synthesizes text to an audio file on disk using the device's native TTS
  * engine. The promise resolves once the entire file has been written.
  *
- * - **iOS**: Uses `AVSpeechSynthesizer.write(_:toBufferCallback:)` to capture
- *   PCM buffers, streams them as Int16 mono into a `.wav` via `AVAudioFile`.
+ * - **iOS**: Uses `AVSpeechSynthesizer.write(_:toBufferCallback:)`, converts
+ *   buffers to Int16 mono PCM, and writes a `.wav` via `AVAudioFile`.
  * - **Android**: Uses `TextToSpeech.synthesizeToFile()` which writes a `.wav`.
  *
  * `filePath` must end with `.wav`.
