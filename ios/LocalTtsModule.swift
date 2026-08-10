@@ -9,6 +9,9 @@ public class LocalTtsModule: Module, @unchecked Sendable {
   private let synthQueue = DispatchQueue(label: "expo.modules.localtts.synth")
   private var synthesizer = AVSpeechSynthesizer()
   private var speakDelegate: SpeechDelegate?
+  /// Keeps the file synthesizer alive for the duration of `write(_:toBufferCallback:)`.
+  /// Cleared on completion so the callback can use `[weak fileSynthesizer]` safely.
+  private var activeFileSynthesizer: AVSpeechSynthesizer?
 
   public func definition() -> ModuleDefinition {
     Name("LocalTtsModule")
@@ -23,6 +26,13 @@ public class LocalTtsModule: Module, @unchecked Sendable {
     // ----- speak -----
     AsyncFunction("speak") { (options: SpeakOptions, promise: Promise) in
       self.synthQueue.async {
+        self.configureAudioSessionIfNeeded()
+
+        // Cancel any in-flight utterance so its delegate can settle before we replace it.
+        if self.synthesizer.isSpeaking {
+          self.synthesizer.stopSpeaking(at: .immediate)
+        }
+
         let utterance = self.buildUtterance(options)
         let delegate = SpeechDelegate(
           onStart: { [weak self] in
@@ -34,10 +44,12 @@ public class LocalTtsModule: Module, @unchecked Sendable {
               "charLength": charLength
             ])
           },
-          onFinish: {
+          onFinish: { [weak self] in
+            self?.sendEvent("onSpeechDone", [:])
             promise.resolve(nil)
           },
-          onError: { message in
+          onError: { [weak self] message in
+            self?.sendEvent("onSpeechError", ["message": message])
             promise.reject("ERR_TTS_SPEAK", message)
           }
         )
@@ -55,19 +67,9 @@ public class LocalTtsModule: Module, @unchecked Sendable {
           return
         }
 
-        let utterance = AVSpeechUtterance(string: options.text)
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * Float(options.rate)
-        utterance.pitchMultiplier = Float(options.pitch)
-        
-        if !options.language.isEmpty {
-          utterance.voice = AVSpeechSynthesisVoice(language: options.language)
-        }
-        if !options.voice.isEmpty {
-          if let found = AVSpeechSynthesisVoice(identifier: options.voice) {
-            utterance.voice = found
-          }
-        }
+        self.configureAudioSessionIfNeeded()
 
+        let utterance = self.buildUtterance(options)
         let fileURL = URL(fileURLWithPath: options.filePath)
 
         // Ensure parent directory exists
@@ -76,33 +78,64 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 
         var audioFile: AVAudioFile?
         var writeError: Error?
-        var fileSynthesizer: AVSpeechSynthesizer? = AVSpeechSynthesizer()
+        var didSettle = false
+        let settleLock = NSLock()
 
-        fileSynthesizer?.write(utterance) { buffer in
-          guard let pcmBuffer = buffer as? AVAudioPCMBuffer,
-                pcmBuffer.frameLength > 0 else {
-            // Empty buffer signals completion
-            if let err = writeError {
-              promise.reject("ERR_TTS_FILE_WRITE", err.localizedDescription)
-            } else {
-              promise.resolve(nil)
+        func settle(_ body: () -> Void) {
+          settleLock.lock()
+          defer { settleLock.unlock() }
+          guard !didSettle else { return }
+          didSettle = true
+          body()
+        }
+
+        let fileSynthesizer = AVSpeechSynthesizer()
+        // Module-owned strong ref keeps the synthesizer alive while the callback
+        // only holds `[weak fileSynthesizer]` (no synthesizer ↔ callback cycle).
+        self.activeFileSynthesizer = fileSynthesizer
+
+        // Block this serial queue until synthesis finishes so concurrent
+        // synthesizeToFile calls cannot interleave PCM writes / file headers.
+        let done = DispatchSemaphore(value: 0)
+
+        fileSynthesizer.write(utterance) { [weak self, weak fileSynthesizer] buffer in
+          guard let pcmBuffer = buffer as? AVAudioPCMBuffer else { return }
+          _ = fileSynthesizer // intentional weak capture (module retains via activeFileSynthesizer)
+
+          if pcmBuffer.frameLength == 0 {
+            settle {
+              if let err = writeError {
+                promise.reject("ERR_TTS_FILE_WRITE", err.localizedDescription)
+              } else {
+                promise.resolve(nil)
+              }
+              self?.activeFileSynthesizer = nil
             }
-            fileSynthesizer = nil // Break the retain cycle
+            done.signal()
             return
           }
 
-          do {
-            if audioFile == nil {
-              audioFile = try AVAudioFile(
-                forWriting: fileURL,
-                settings: pcmBuffer.format.settings,
-                commonFormat: pcmBuffer.format.commonFormat,
-                interleaved: pcmBuffer.format.isInterleaved
-              )
+          autoreleasepool {
+            do {
+              if audioFile == nil {
+                audioFile = try AVAudioFile(
+                  forWriting: fileURL,
+                  settings: pcmBuffer.format.settings,
+                  commonFormat: pcmBuffer.format.commonFormat,
+                  interleaved: pcmBuffer.format.isInterleaved
+                )
+              }
+              try audioFile?.write(from: pcmBuffer)
+            } catch {
+              writeError = error
             }
-            try audioFile?.write(from: pcmBuffer)
-          } catch {
-            writeError = error
+          }
+        }
+
+        if done.wait(timeout: .now() + 600) == .timedOut {
+          settle {
+            self.activeFileSynthesizer = nil
+            promise.reject("ERR_TTS_FILE_TIMEOUT", "synthesizeToFile timed out after 600s")
           }
         }
       }
@@ -112,12 +145,10 @@ public class LocalTtsModule: Module, @unchecked Sendable {
     AsyncFunction("getVoices") { () -> [[String: Any]] in
       AVSpeechSynthesisVoice.speechVoices().map { voice in
         var quality = "default"
-        if #available(iOS 9.0, *) {
-          switch voice.quality {
-          case .enhanced: quality = "enhanced"
-          case .premium:  quality = "premium"
-          default:        quality = "default"
-          }
+        if #available(iOS 16.0, *), voice.quality == .premium {
+          quality = "premium"
+        } else if #available(iOS 9.0, *), voice.quality == .enhanced {
+          quality = "enhanced"
         }
         return [
           "identifier": voice.identifier,
@@ -141,22 +172,95 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 
   // MARK: - Helpers
 
-  private func buildUtterance(_ options: SpeakOptions) -> AVSpeechUtterance {
-    let utterance = AVSpeechUtterance(string: options.text)
-    // Rate: AVSpeechUtterance expects 0..1 range where 0.5 is default.
-    // We map the user's 1.0 (normal) to AVSpeechUtteranceDefaultSpeechRate.
-    utterance.rate = AVSpeechUtteranceDefaultSpeechRate * Float(options.rate)
-    utterance.pitchMultiplier = Float(options.pitch)
+  private func configureAudioSessionIfNeeded() {
+    do {
+      let audioSession = AVAudioSession.sharedInstance()
+      // .playback + .spokenAudio keeps synthesis off the 16 kHz telephony path.
+      try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+      // Request native media sample rate before activation (hardware may still negotiate).
+      try audioSession.setPreferredSampleRate(44_100)
+      try audioSession.setActive(true)
+    } catch {
+      print("[LocalTtsModule] AudioSession configuration warning: \(error.localizedDescription)")
+    }
+  }
 
-    if !options.language.isEmpty {
-      utterance.voice = AVSpeechSynthesisVoice(language: options.language)
-    }
-    if !options.voice.isEmpty {
-      if let found = AVSpeechSynthesisVoice(identifier: options.voice) {
-        utterance.voice = found
+  private func buildUtterance(_ options: SpeakOptions) -> AVSpeechUtterance {
+    createUtterance(
+      text: options.text,
+      rate: options.rate,
+      pitch: options.pitch,
+      language: options.language,
+      voice: options.voice
+    )
+  }
+
+  private func buildUtterance(_ options: SynthesizeOptions) -> AVSpeechUtterance {
+    createUtterance(
+      text: options.text,
+      rate: options.rate,
+      pitch: options.pitch,
+      language: options.language,
+      voice: options.voice
+    )
+  }
+
+  private func createUtterance(
+    text: String,
+    rate: Double,
+    pitch: Double,
+    language: String,
+    voice: String
+  ) -> AVSpeechUtterance {
+    let utterance = AVSpeechUtterance(string: text)
+    // Rate: map user 1.0 (normal) to AVSpeechUtteranceDefaultSpeechRate.
+    utterance.rate = AVSpeechUtteranceDefaultSpeechRate * Float(rate)
+    utterance.pitchMultiplier = Float(pitch)
+    // Micro-pause between utterance chunks for more natural pacing
+    utterance.postUtteranceDelay = 0.12
+
+    // Priority 1: explicit voice identifier
+    if !voice.isEmpty {
+      if let foundVoice = AVSpeechSynthesisVoice(identifier: voice) {
+        utterance.voice = foundVoice
+        return utterance
       }
+      print("[LocalTtsModule] Specified voice identifier '\(voice)' not found, attempting language fallback.")
     }
+
+    // Priority 2: best installed voice for language (premium > enhanced > default)
+    if !language.isEmpty {
+      utterance.voice = bestVoice(forLanguage: language)
+    }
+
     return utterance
+  }
+
+  /// Picks the highest-quality installed voice matching `language` (BCP-47).
+  private func bestVoice(forLanguage language: String) -> AVSpeechSynthesisVoice? {
+    let voices = AVSpeechSynthesisVoice.speechVoices().filter { voice in
+      voice.language.caseInsensitiveCompare(language) == .orderedSame
+        || voice.language.lowercased().hasPrefix(language.lowercased() + "-")
+        || language.lowercased().hasPrefix(voice.language.lowercased())
+    }
+
+    if voices.isEmpty {
+      return AVSpeechSynthesisVoice(language: language)
+    }
+
+    return voices.max { lhs, rhs in
+      voiceQualityRank(lhs) < voiceQualityRank(rhs)
+    }
+  }
+
+  private func voiceQualityRank(_ voice: AVSpeechSynthesisVoice) -> Int {
+    if #available(iOS 16.0, *) {
+      if voice.quality == .premium { return 3 }
+    }
+    if #available(iOS 9.0, *) {
+      if voice.quality == .enhanced { return 2 }
+    }
+    return 1
   }
 }
 

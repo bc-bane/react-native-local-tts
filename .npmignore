@@ -2,7 +2,6 @@ __tests__/
 __mocks__/
 example/
 node_modules/
-src/
 .git/
 .vscode/
 .idea/

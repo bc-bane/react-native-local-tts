@@ -11,8 +11,9 @@
 - **List available voices** with quality tiers and language tags
 - **Word-level progress events** (`onSpeechProgress`) for live UI updates
 - **Speech lifecycle events** — start, done, error
+- **React hook** — `useLocalTts()` for progress, synthesis status, and errors
 - **Playback control** — `stop()` and `isSpeaking()`
-- **Expo SDK 57+ / React Native New Architecture** compatible
+- **Expo SDK 56+ / React Native New Architecture** compatible
 - **No Expo Go** required — works with dev clients and standalone builds
 
 ---
@@ -75,6 +76,33 @@ stop();
 console.log(isSpeaking()); // true or false
 ```
 
+### React Hook
+
+```tsx
+import { useLocalTts } from 'react-native-local-tts';
+
+function Reader() {
+  const { speak, synthesizeToFile, isSpeaking, isSynthesizing, progress, error } = useLocalTts();
+
+  return (
+    <>
+      <Button title={isSpeaking ? 'Speaking…' : 'Speak'} onPress={() => speak({ text: 'Hi' })} />
+      <Button
+        title={isSynthesizing ? 'Writing…' : 'Save audio'}
+        onPress={() =>
+          synthesizeToFile({
+            text: 'Offline chapter',
+            filePath: `${FileSystem.documentDirectory}chapter.caf`,
+          })
+        }
+      />
+      {progress ? <Text>Word @ {progress.charIndex}</Text> : null}
+      {error ? <Text>{error}</Text> : null}
+    </>
+  );
+}
+```
+
 ---
 
 ## Event Listeners
@@ -107,10 +135,11 @@ subs.forEach(sub => sub.remove());
 |----------|---------|-------------|
 | `speak(options)` | `Promise<void>` | Speak text aloud. Resolves when speech finishes. |
 | `synthesizeToFile(options)` | `Promise<void>` | Write synthesized speech to an audio file. |
-| `getVoices()` | `Promise<TtsVoice[]>` | List all available TTS voices on the device. |
+| `getVoices()` | `Promise<VoiceInfo[]>` | List all available TTS voices on the device. |
 | `stop()` | `void` | Immediately stop any in-progress speech. |
 | `isSpeaking()` | `boolean` | Check if the TTS engine is currently speaking. |
 | `isAvailable` | `boolean` | Whether the native module is loaded. |
+| `useLocalTts()` | hook state + actions | React hook for speech/synthesis UI state. |
 
 ### `SpeakOptions`
 
@@ -133,7 +162,7 @@ subs.forEach(sub => sub.remove());
 | `language` | `string` | device default | BCP-47 language tag. |
 | `voice` | `string` | — | Platform-specific voice identifier. |
 
-### `TtsVoice`
+### `VoiceInfo` (alias: `TtsVoice`)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -159,11 +188,13 @@ All event functions return `{ remove: () => void }` to unsubscribe.
 
 ### iOS
 - Uses `AVSpeechSynthesizer` for speech and `AVSpeechSynthesizer.write(_:toBufferCallback:)` (iOS 13+) for file synthesis.
+- Activates `AVAudioSession` with `.playback` / `.spokenAudio` before synthesis.
 - File synthesis writes `.caf` (Core Audio Format) with PCM data via `AVAudioFile`.
 - Voice quality tiers map to `AVSpeechSynthesisVoiceQuality` (`.default`, `.enhanced`, `.premium`).
 
 ### Android
 - Uses `android.speech.tts.TextToSpeech` for speech and `TextToSpeech.synthesizeToFile()` for file synthesis.
+- Configures `AudioAttributes` (`USAGE_MEDIA` / `CONTENT_TYPE_SPEECH`) and `STREAM_MUSIC` params.
 - File synthesis writes `.wav` files natively.
 - Word-level progress requires API 26+ (`onRangeStart`); on older devices only start/done events fire.
 - The TTS engine initializes asynchronously on module creation; functions wait up to 5 seconds for initialization.
