@@ -513,7 +513,10 @@ private final class Int16MonoWavSink {
       vDSP_vclip(src, 1, &lo, &hi, tempBase, 1, n)
       var scale = Float(Int16.max)
       vDSP_vsmul(tempBase, 1, &scale, tempBase, 1, n)
-      vDSP_vfixq(tempBase, 1, dst, 1, n)
+      // Swift Accelerate overlay (C `vDSP_vfixq` is not always imported).
+      var source = UnsafeBufferPointer(start: tempBase, count: frames)
+      var destination = UnsafeMutableBufferPointer(start: dst, count: frames)
+      vDSP.convert(source, toInteger: &destination)
     }
   }
 }
