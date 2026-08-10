@@ -72,9 +72,10 @@ public class LocalTtsModule: Module, @unchecked Sendable {
         let utterance = self.buildUtterance(options)
         let fileURL = URL(fileURLWithPath: options.filePath)
 
-        // Ensure parent directory exists
+        // Ensure parent directory exists; overwrite any prior file at this path.
         let dir = fileURL.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: fileURL)
 
         var audioFile: AVAudioFile?
         var writeError: Error?
@@ -102,10 +103,24 @@ public class LocalTtsModule: Module, @unchecked Sendable {
           guard let pcmBuffer = buffer as? AVAudioPCMBuffer else { return }
           _ = fileSynthesizer // intentional weak capture (module retains via activeFileSynthesizer)
 
-          if pcmBuffer.frameLength == 0 {
+          // iOS ≤16 ends with frameLength == 0. iOS 17+ Float32 paths often end
+          // with a trailing buffer of frameLength == 1 (silent). Treat both as done.
+          let isTerminalBuffer: Bool
+          if pcmBuffer.format.commonFormat == .pcmFormatFloat32 {
+            isTerminalBuffer = pcmBuffer.frameLength <= 1
+          } else {
+            isTerminalBuffer = pcmBuffer.frameLength == 0
+          }
+
+          if isTerminalBuffer {
             settle {
               if let err = writeError {
                 promise.reject("ERR_TTS_FILE_WRITE", err.localizedDescription)
+              } else if audioFile == nil {
+                promise.reject(
+                  "ERR_TTS_FILE_EMPTY",
+                  "synthesizeToFile produced no audio buffers"
+                )
               } else {
                 promise.resolve(nil)
               }
@@ -134,6 +149,7 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 
         if done.wait(timeout: .now() + 600) == .timedOut {
           settle {
+            self.activeFileSynthesizer?.stopSpeaking(at: .immediate)
             self.activeFileSynthesizer = nil
             promise.reject("ERR_TTS_FILE_TIMEOUT", "synthesizeToFile timed out after 600s")
           }
@@ -162,6 +178,8 @@ public class LocalTtsModule: Module, @unchecked Sendable {
     // ----- stop -----
     Function("stop") {
       self.synthesizer.stopSpeaking(at: .immediate)
+      // Also cancel in-flight file synthesis (write(_:toBufferCallback:)).
+      self.activeFileSynthesizer?.stopSpeaking(at: .immediate)
     }
 
     // ----- isSpeaking -----
@@ -213,10 +231,16 @@ public class LocalTtsModule: Module, @unchecked Sendable {
     voice: String
   ) -> AVSpeechUtterance {
     let utterance = AVSpeechUtterance(string: text)
-    // Rate: map user 1.0 (normal) to AVSpeechUtteranceDefaultSpeechRate.
-    utterance.rate = AVSpeechUtteranceDefaultSpeechRate * Float(rate)
-    utterance.pitchMultiplier = Float(pitch)
-    // Micro-pause between utterance chunks for more natural pacing
+    // Rate: map user 1.0 (normal) to AVSpeechUtteranceDefaultSpeechRate, then
+    // clamp into Apple's documented min/max speech-rate range.
+    let scaledRate = AVSpeechUtteranceDefaultSpeechRate * Float(rate)
+    utterance.rate = min(
+      AVSpeechUtteranceMaximumSpeechRate,
+      max(AVSpeechUtteranceMinimumSpeechRate, scaledRate)
+    )
+    // pitchMultiplier is documented as roughly 0.5...2.0
+    utterance.pitchMultiplier = min(2.0, max(0.5, Float(pitch)))
+    // Micro-pause between queued speak() utterances (not meaningful for write()).
     utterance.postUtteranceDelay = 0.12
 
     // Priority 1: explicit voice identifier

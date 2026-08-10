@@ -93,8 +93,8 @@ class LocalTtsModule : Module() {
 
       val engine = tts!!
       applyVoiceSettings(engine, options.language, options.voice)
-      engine.setSpeechRate(options.rate.toFloat())
-      engine.setPitch(options.pitch.toFloat())
+      engine.setSpeechRate(options.rate.toFloat().coerceIn(0.1f, 2.0f))
+      engine.setPitch(options.pitch.toFloat().coerceIn(0.5f, 2.0f))
 
       val utteranceId = "speak-${System.nanoTime()}"
       activePromises[utteranceId] = promise
@@ -117,14 +117,33 @@ class LocalTtsModule : Module() {
 
       val engine = tts!!
       applyVoiceSettings(engine, options.language, options.voice)
-      engine.setSpeechRate(options.rate.toFloat())
-      engine.setPitch(options.pitch.toFloat())
+      engine.setSpeechRate(options.rate.toFloat().coerceIn(0.1f, 2.0f))
+      engine.setPitch(options.pitch.toFloat().coerceIn(0.5f, 2.0f))
 
       val utteranceId = "synth-${System.nanoTime()}"
       val outputFile = File(options.filePath)
 
-      // Ensure parent directory exists
+      // Ensure parent directory exists; overwrite any prior file at this path.
       outputFile.parentFile?.mkdirs()
+      if (outputFile.exists()) {
+        outputFile.delete()
+      }
+
+      if (options.text.isBlank()) {
+        promise.reject("ERR_TTS_FILE", "synthesizeToFile requires non-empty text", null)
+        return@AsyncFunction
+      }
+
+      // Android engines commonly truncate / fail past ~3999 characters per request.
+      if (options.text.length > 3999) {
+        promise.reject(
+          "ERR_TTS_FILE",
+          "synthesizeToFile text exceeds Android TTS limit (3999 chars); got ${options.text.length}",
+          null
+        )
+        return@AsyncFunction
+      }
+
       activePromises[utteranceId] = promise
 
       val params = Bundle().apply {
