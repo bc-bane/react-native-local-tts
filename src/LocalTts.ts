@@ -38,6 +38,7 @@ type LocalTtsModuleType = InstanceType<typeof NativeModule> & {
     pitch: number;
     language: string;
     voice: string;
+    qualityMode: boolean;
   }): Promise<void>;
 
   synthesizeToFile(options: {
@@ -47,6 +48,7 @@ type LocalTtsModuleType = InstanceType<typeof NativeModule> & {
     pitch: number;
     language: string;
     voice: string;
+    qualityMode: boolean;
   }): Promise<void>;
 
   getVoices(): Promise<VoiceInfo[]>;
@@ -82,6 +84,8 @@ function normalizeSpeak(options: SpeakOptions) {
     pitch: options.pitch ?? 1.0,
     language: options.language ?? "",
     voice: options.voice ?? "",
+    // Preview should sound like System Settings by default.
+    qualityMode: options.qualityMode ?? true,
   };
 }
 
@@ -94,6 +98,8 @@ function normalizeSynthesize(options: SynthesizeOptions) {
     pitch: options.pitch ?? 1.0,
     language: options.language ?? "",
     voice: options.voice ?? "",
+    // Book conversion defaults to the faster routing path.
+    qualityMode: options.qualityMode ?? false,
   };
 }
 

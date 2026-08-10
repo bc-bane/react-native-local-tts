@@ -29,6 +29,8 @@ private class SpeakOptions : Record {
   @Field var pitch: Double = 1.0
   @Field var language: String = ""
   @Field var voice: String = ""
+  /** iOS-only; accepted for API parity. */
+  @Field var qualityMode: Boolean = true
 }
 
 private class SynthesizeOptions : Record {
@@ -38,6 +40,8 @@ private class SynthesizeOptions : Record {
   @Field var pitch: Double = 1.0
   @Field var language: String = ""
   @Field var voice: String = ""
+  /** iOS-only; accepted for API parity. */
+  @Field var qualityMode: Boolean = false
 }
 
 // ---------------------------------------------------------------------------

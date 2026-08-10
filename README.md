@@ -150,6 +150,7 @@ subs.forEach(sub => sub.remove());
 | `pitch` | `number` | `1.0` | Pitch multiplier (0.5 = lower, 2.0 = higher). |
 | `language` | `string` | device default | BCP-47 language tag (e.g. `"en-US"`). |
 | `voice` | `string` | — | Platform-specific voice identifier. Overrides `language`. |
+| `qualityMode` | `boolean` | `true` | **iOS:** `true` = `.default` + `usesApplicationAudioSession = false`; `false` = `.spokenAudio` + app session. No-op on Android. |
 
 ### `SynthesizeOptions`
 
@@ -161,6 +162,7 @@ subs.forEach(sub => sub.remove());
 | `pitch` | `number` | `1.0` | Pitch multiplier (0.5 = lower, 2.0 = higher). |
 | `language` | `string` | device default | BCP-47 language tag. |
 | `voice` | `string` | — | Platform-specific voice identifier. |
+| `qualityMode` | `boolean` | `false` | **iOS:** same routing as speak; default `false` for faster book conversion. No-op on Android. |
 
 ### `VoiceInfo` (alias: `TtsVoice`)
 
@@ -188,7 +190,7 @@ All event functions return `{ remove: () => void }` to unsubscribe.
 
 ### iOS
 - Uses `AVSpeechSynthesizer` for speech and `AVSpeechSynthesizer.write(_:toBufferCallback:)` (iOS 13+) for file synthesis.
-- Activates `AVAudioSession` with `.playback` / `.spokenAudio` before synthesis.
+- Activates `AVAudioSession` with `.playback` before synthesis; mode is `.default` or `.spokenAudio` based on `qualityMode`.
 - File synthesis streams buffers as Int16 mono into a `.wav` (`filePath` must end with `.wav`).
 - Voice quality tiers map to `AVSpeechSynthesisVoiceQuality` (`.default`, `.enhanced`, `.premium`).
 

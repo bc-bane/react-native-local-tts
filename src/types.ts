@@ -37,6 +37,14 @@ export type SpeakOptions = {
    * If provided, overrides `language`.
    */
   voice?: string;
+  /**
+   * iOS audio routing for natural vs faster synthesis.
+   * - `true` — `AVAudioSession` `.default` + `usesApplicationAudioSession = false` (better neural/premium timbre).
+   * - `false` — `.spokenAudio` + `usesApplicationAudioSession = true` (faster / more compatible).
+   * No-op on Android.
+   * @default true for {@link speak}
+   */
+  qualityMode?: boolean;
 };
 
 /**
@@ -68,6 +76,14 @@ export type SynthesizeOptions = {
    * Platform-specific voice identifier. Overrides `language` if provided.
    */
   voice?: string;
+  /**
+   * iOS audio routing for natural vs faster offline synthesis.
+   * - `true` — `AVAudioSession` `.default` + `usesApplicationAudioSession = false` (better neural/premium timbre; slower).
+   * - `false` — `.spokenAudio` + `usesApplicationAudioSession = true` (faster book conversion).
+   * No-op on Android.
+   * @default false for {@link synthesizeToFile}
+   */
+  qualityMode?: boolean;
 };
 
 /**

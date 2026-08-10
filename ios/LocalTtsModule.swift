@@ -19,8 +19,9 @@ import AVFoundation
 //    can stall the calling thread. Prefer a long-lived file synthesizer and
 //    avoid doing that work on AsyncFunctionQueue.
 //
-// 4. Offline `write` keeps default `usesApplicationAudioSession == true`.
-//    `false` is only for live `speak()` preview quality.
+// 4. Audio routing is controlled by `qualityMode`:
+//    - true  → session `.default`  + usesApplicationAudioSession = false (natural timbre)
+//    - false → session `.spokenAudio` + usesApplicationAudioSession = true (faster)
 //
 // 5. `AVAudioFile` must use the buffer's own commonFormat + isInterleaved.
 // ---------------------------------------------------------------------------
@@ -43,6 +44,7 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 
   private var fileJobRunning = false
   private var pendingFileJobs: [(SynthesizeOptions, Promise)] = []
+  private var lastFileQualityMode: Bool?
 
   public func definition() -> ModuleDefinition {
     Name("LocalTtsModule")
@@ -64,7 +66,10 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 
     AsyncFunction("speak") { (options: SpeakOptions, promise: Promise) in
       self.speakQueue.async {
-        self.configureSpeakAudioSession()
+        self.applyAudioRouting(
+          synthesizer: self.speakSynthesizer,
+          qualityMode: options.qualityMode
+        )
 
         if self.speakSynthesizer.isSpeaking {
           self.speakSynthesizer.stopSpeaking(at: .immediate)
@@ -154,7 +159,7 @@ public class LocalTtsModule: Module, @unchecked Sendable {
       return fileSynthesizer
     }
     let synth = AVSpeechSynthesizer()
-    // Default usesApplicationAudioSession (= true) required for write(_:).
+    // Routing is applied per job via applyAudioRouting(qualityMode:).
     fileSynthesizer = synth
     return synth
   }
@@ -187,6 +192,7 @@ public class LocalTtsModule: Module, @unchecked Sendable {
           synthesizer: synth,
           utterance: utterance,
           fileURL: fileURL,
+          qualityMode: options.qualityMode,
           promise: promise
         )
       }
@@ -206,11 +212,12 @@ public class LocalTtsModule: Module, @unchecked Sendable {
     synthesizer: AVSpeechSynthesizer,
     utterance: AVSpeechUtterance,
     fileURL: URL,
+    qualityMode: Bool,
     promise: Promise
   ) {
     assert(Thread.isMainThread)
 
-    configureFileAudioSession()
+    applyAudioRouting(synthesizer: synthesizer, qualityMode: qualityMode)
 
     if synthesizer.isSpeaking {
       synthesizer.stopSpeaking(at: .immediate)
@@ -293,27 +300,28 @@ public class LocalTtsModule: Module, @unchecked Sendable {
 
   // MARK: - Audio sessions
 
-  private func configureSpeakAudioSession() {
-    do {
-      let audioSession = AVAudioSession.sharedInstance()
-      try audioSession.setCategory(.playback, mode: .default, options: [.duckOthers])
-      try audioSession.setPreferredSampleRate(44_100)
-      try audioSession.setActive(true)
-    } catch {
-      print("[LocalTtsModule] Speak AudioSession warning: \(error.localizedDescription)")
-    }
-  }
+  /// Applies iOS routing for quality vs speed.
+  /// - qualityMode true: `.default` + `usesApplicationAudioSession = false`
+  /// - qualityMode false: `.spokenAudio` + `usesApplicationAudioSession = true`
+  private func applyAudioRouting(synthesizer: AVSpeechSynthesizer, qualityMode: Bool) {
+    synthesizer.usesApplicationAudioSession = !qualityMode
 
-  private func configureFileAudioSession() {
+    // Skip redundant session churn during long book conversions.
+    if let fileSynthesizer, synthesizer === fileSynthesizer {
+      if lastFileQualityMode == qualityMode {
+        return
+      }
+      lastFileQualityMode = qualityMode
+    }
+
     do {
       let audioSession = AVAudioSession.sharedInstance()
-      // Prefer .default over .spokenAudio for offline write: spokenAudio engages
-      // accessibility EQ/NR that makes premium/neural voices sound robotic.
-      try audioSession.setCategory(.playback, mode: .default, options: [.duckOthers])
+      let mode: AVAudioSession.Mode = qualityMode ? .default : .spokenAudio
+      try audioSession.setCategory(.playback, mode: mode, options: [.duckOthers])
       try audioSession.setPreferredSampleRate(44_100)
       try audioSession.setActive(true)
     } catch {
-      print("[LocalTtsModule] File AudioSession warning: \(error.localizedDescription)")
+      print("[LocalTtsModule] AudioSession warning: \(error.localizedDescription)")
     }
   }
 
@@ -597,6 +605,7 @@ private struct SpeakOptions: Record {
   @Field var pitch: Double = 1.0
   @Field var language: String = ""
   @Field var voice: String = ""
+  @Field var qualityMode: Bool = true
 }
 
 private struct SynthesizeOptions: Record {
@@ -606,6 +615,7 @@ private struct SynthesizeOptions: Record {
   @Field var pitch: Double = 1.0
   @Field var language: String = ""
   @Field var voice: String = ""
+  @Field var qualityMode: Bool = false
 }
 
 // ---------------------------------------------------------------------------
