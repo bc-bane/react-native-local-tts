@@ -513,10 +513,12 @@ private final class Int16MonoWavSink {
       vDSP_vclip(src, 1, &lo, &hi, tempBase, 1, n)
       var scale = Float(Int16.max)
       vDSP_vsmul(tempBase, 1, &scale, tempBase, 1, n)
-      // Swift Accelerate overlay (C `vDSP_vfixq` is not always imported).
-      var source = UnsafeBufferPointer(start: tempBase, count: frames)
-      var destination = UnsafeMutableBufferPointer(start: dst, count: frames)
-      vDSP.convert(source, toInteger: &destination)
+      // Quantize with rounding. Prefer a typed loop over Accelerate overlays —
+      // vDSP.convert Float→Int16 is not consistently resolvable across SDKs, and
+      // vDSP_vfixq writes Int32 (wrong width for our Int16 CAF path).
+      for i in 0..<frames {
+        dst[i] = Int16(clamping: Int(tempBase[i].rounded(.toNearestOrAwayFromZero)))
+      }
     }
   }
 }
